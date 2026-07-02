@@ -41,39 +41,66 @@ generate or overwrite one.
 
 Add one piece of state to `Kernel`: `self._active_correlation_id: Optional[UUID] = None`.
 
-In `Kernel.publish(self, event: Event)`, before the existing
-`if self._replaying: return` logic continues:
+**Correction found while tracing the real production path** (see
+"Rejected first draft" below): the id must be cleared when the *scheduler
+queue actually drains to empty*, not when the top-level `publish()` call
+returns. After `Kernel.start()`, normal publishes (any non-lifecycle event)
+do **not** auto-drain — `main.run_bootstrap_cycle` calls
+`organism.kernel.run_until_idle()` itself, separately, after
+`Perception.record_observation` returns. A clear-on-return-from-publish
+design would reset `_active_correlation_id` to `None` before that drain
+even starts, so every cascade event dispatched during it would wrongly look
+like a fresh root. Tying the clear to "scheduler is empty" instead works
+under both auto-drain (kernel not yet started) and caller-driven drain
+(kernel already running) alike.
+
+In `Kernel.publish(self, event: Event)`:
 
 ```python
 def publish(self, event: Event) -> None:
     if self._replaying:
         return
-    is_root = self._active_correlation_id is None
     if event.correlation_id is None:
-        event.correlation_id = self._active_correlation_id or uuid4()
-    if is_root:
+        event.correlation_id = (
+            self._active_correlation_id if self._active_correlation_id is not None else uuid4()
+        )
+    if self._active_correlation_id is None:
         self._active_correlation_id = event.correlation_id
-    try:
-        self.event_log.append(event)
-        ...  # existing scheduling logic
-        if not self._dispatching and (...):
-            self.run_until_idle()
-    finally:
-        if is_root:
-            self._active_correlation_id = None
+    self.event_log.append(event)
+    ...  # existing scheduling logic, unchanged
+    if not self._dispatching and (...):
+        self.run_until_idle()
+```
+
+In `Kernel._dispatch_scheduled(self, event: Event)`, after the existing
+dispatch logic (both on the normal path and the `self._stopping` early
+return), add: once the scheduler has nothing left queued, the cascade this
+correlation id belonged to is fully drained, so clear it:
+
+```python
+if self.scheduler.pending_count() == 0:
+    self._active_correlation_id = None
 ```
 
 Rules encoded:
-- **Root publish** (no active correlation in flight): assign a fresh
-  `uuid4()` if the event doesn't already have one, mark it active for the
-  duration of this call's `run_until_idle()` drain, clear it afterward.
-- **Nested publish** (called while a root's cascade is still draining,
-  i.e. `_active_correlation_id` is set — includes both genuinely nested
-  calls and same-loop cascade calls scheduled via `Scheduler`): inherit the
-  active id.
+- **Root publish** (no active correlation in flight when `publish()` is
+  called): assign a fresh `uuid4()` if the event doesn't already have one,
+  and mark it active.
+- **Nested / cascade publish** (called while a correlation is already
+  active — covers both a subscriber calling `kernel.publish()` directly
+  during `dispatch()`, and the far more common case here: a later task on
+  the same `Scheduler` queue, drained by a `run_until_idle()` call that may
+  happen well after the original `publish()` returned): inherit the active
+  id.
+- **Clearing**: happens in `_dispatch_scheduled`, gated on
+  `scheduler.pending_count() == 0` — i.e. exactly when the whole cascade
+  from one root event has finished, regardless of which code path is
+  driving the drain (auto-drain inside `publish()`, an explicit
+  `run_until_idle()` call, or manual `process_next()` calls in tests).
 - **Already-stamped event** (defensive only — never triggered by current
   components, but keeps replayed/re-published events with a real id from
-  being clobbered): if `event.correlation_id` is already set, leave it.
+  being clobbered): if `event.correlation_id` is already set, leave it; also
+  don't stomp `_active_correlation_id` if it's already set.
 - `uuid4` needs importing in `src/kernel/__init__.py` (`UUID` is already
   imported; `uuid4` is not).
 - No changes to `EventLog`, no changes to any component (`Perception`,
@@ -81,6 +108,21 @@ Rules encoded:
   `InferencePort`) — they keep constructing events the same way they do
   today, satisfying "no component-specific propagation logic" and "existing
   public APIs unchanged."
+
+### Rejected first draft
+
+An earlier version of this design wrapped `publish()` itself in
+`try/finally` and cleared `_active_correlation_id` there whenever the
+current call was the root. That's wrong: after the kernel is started,
+`publish()` for a non-lifecycle event schedules the task but returns
+*without draining* (`run_until_idle()` isn't called from inside `publish()`
+in that case — the caller drains separately, later). The `finally` would
+have cleared the active id immediately on return, before any dispatch — and
+therefore before any nested/cascade event existed — breaking propagation
+for exactly the real `main.py` / `run_bootstrap_cycle` path this feature
+exists for. Caught by tracing `Kernel.start()` →
+`Perception.record_observation()` → `Kernel.run_until_idle()` step by step
+before writing any code.
 
 ## Testing
 
