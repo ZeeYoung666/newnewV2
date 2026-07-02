@@ -14,11 +14,24 @@ class EventType(str, Enum):
 
     BELIEF_CREATED = "belief.created"
     BELIEF_UPDATED = "belief.updated"
+    OPPORTUNITY_IDENTIFIED = "opportunity.identified"
+    OPPORTUNITY_SCORED = "opportunity.scored"
     PLAN_PROPOSED = "plan.proposed"
     PLAN_ABANDONED = "plan.abandoned"
     PLAN_SELECTED = "plan.selected"
+    POLICY_EVALUATED = "policy.evaluated"
+    BUDGET_CHECKED = "budget.checked"
     APPROVAL_GRANTED = "approval.granted"
+    APPROVAL_DENIED = "approval.denied"
+    APPROVAL_REQUIRED = "approval.required"
+    ACTION_APPROVED = "action.approved"
     ACTION_ATTEMPTED = "action.attempted"
+    ACTION_SUCCEEDED = "action.succeeded"
+    ACTION_FAILED = "action.failed"
+    OUTCOME_RECORDED = "outcome.recorded"
+    LEDGER_ENTRY_POSTED = "ledger.entry_posted"
+    INFERENCE_REQUESTED = "inference.requested"
+    INFERENCE_COMPLETED = "inference.completed"
     OBSERVATION_CREATED = "observation.created"
     KERNEL_STARTING = "kernel.starting"
     KERNEL_STARTED = "kernel.started"
@@ -61,12 +74,36 @@ class BeliefUpdatedEvent(Event):
 
 
 @dataclass(slots=True, kw_only=True)
+class OpportunityIdentifiedEvent(Event):
+    """Represents a new opportunity discovered from beliefs."""
+
+    opportunity_id: str
+    belief_ids: tuple[str, ...]
+    confidence: float
+    event_type: EventType = EventType.OPPORTUNITY_IDENTIFIED
+
+
+@dataclass(slots=True, kw_only=True)
+class OpportunityScoredEvent(Event):
+    """Represents an expected-value estimate assigned to an opportunity."""
+
+    opportunity_id: str
+    expected_value: float
+    confidence: float
+    event_type: EventType = EventType.OPPORTUNITY_SCORED
+
+
+@dataclass(slots=True, kw_only=True)
 class PlanProposedEvent(Event):
     """Represents a plan created during planning."""
 
     plan_id: str
     opportunity_id: str
     rationale: str
+    expected_value: float
+    attention_cost: float
+    capital_cost: float
+    ordered_actions: tuple[str, ...]
     event_type: EventType = EventType.PLAN_PROPOSED
 
 
@@ -90,13 +127,58 @@ class ExecutiveDecisionEvent(Event):
 
 
 @dataclass(slots=True, kw_only=True)
+class PolicyEvaluatedEvent(Event):
+    """Represents the outcome of evaluating a plan against the constitution."""
+
+    plan_id: str
+    constitution_id: str
+    passed: bool
+    reason: str
+    event_type: EventType = EventType.POLICY_EVALUATED
+
+
+@dataclass(slots=True, kw_only=True)
+class BudgetCheckedEvent(Event):
+    """Represents the outcome of verifying a plan's cost against available budget."""
+
+    plan_id: str
+    budget_id: str
+    attention_required: float
+    attention_available: float
+    capital_required: float
+    capital_available: float
+    sufficient: bool
+    event_type: EventType = EventType.BUDGET_CHECKED
+
+
+@dataclass(slots=True, kw_only=True)
 class ApprovalGrantedEvent(Event):
-    """Represents a governor approval decision."""
+    """Represents a governor approval decision that granted a plan."""
 
     approval_id: str
-    policy_id: str
-    decision_id: str
+    plan_id: str
+    reason: str
+    ordered_actions: tuple[str, ...]
     event_type: EventType = EventType.APPROVAL_GRANTED
+
+
+@dataclass(slots=True, kw_only=True)
+class ApprovalDeniedEvent(Event):
+    """Represents a governor approval decision that denied a plan."""
+
+    approval_id: str
+    plan_id: str
+    reason: str
+    event_type: EventType = EventType.APPROVAL_DENIED
+
+
+@dataclass(slots=True, kw_only=True)
+class ApprovalRequiredEvent(Event):
+    """Represents a plan the governor could not decide on automatically; escalates to the owner."""
+
+    plan_id: str
+    reason: str
+    event_type: EventType = EventType.APPROVAL_REQUIRED
 
 
 @dataclass(slots=True, kw_only=True)
@@ -107,6 +189,81 @@ class ActionAttemptedEvent(Event):
     tool_name: str
     attempt: int
     event_type: EventType = EventType.ACTION_ATTEMPTED
+
+
+@dataclass(slots=True, kw_only=True)
+class ActionApprovedEvent(Event):
+    """Represents an action authorized to run as part of an approved plan."""
+
+    action_id: str
+    plan_id: str
+    action_type: str
+    event_type: EventType = EventType.ACTION_APPROVED
+
+
+@dataclass(slots=True, kw_only=True)
+class ActionSucceededEvent(Event):
+    """Represents an action that completed successfully."""
+
+    action_id: str
+    plan_id: str
+    result: str
+    event_type: EventType = EventType.ACTION_SUCCEEDED
+
+
+@dataclass(slots=True, kw_only=True)
+class ActionFailedEvent(Event):
+    """Represents an action that failed during execution."""
+
+    action_id: str
+    plan_id: str
+    error: str
+    event_type: EventType = EventType.ACTION_FAILED
+
+
+@dataclass(slots=True, kw_only=True)
+class OutcomeRecordedEvent(Event):
+    """Represents an outcome recorded by Memory & Ledger from an action's result."""
+
+    outcome_id: str
+    action_id: str
+    plan_id: str
+    success: bool
+    result: str
+    event_type: EventType = EventType.OUTCOME_RECORDED
+
+
+@dataclass(slots=True, kw_only=True)
+class LedgerEntryPostedEvent(Event):
+    """Represents a financial ledger entry posted for an executed action."""
+
+    entry_id: str
+    action_id: str
+    delta_attention: float
+    delta_capital: float
+    event_type: EventType = EventType.LEDGER_ENTRY_POSTED
+
+
+@dataclass(slots=True, kw_only=True)
+class InferenceRequestedEvent(Event):
+    """Represents a judgment request sent to the inference port."""
+
+    request_id: str
+    requester: str
+    purpose: str
+    provider_name: str
+    event_type: EventType = EventType.INFERENCE_REQUESTED
+
+
+@dataclass(slots=True, kw_only=True)
+class InferenceCompletedEvent(Event):
+    """Represents a judgment response returned by the inference port."""
+
+    request_id: str
+    response_id: str
+    provider_name: str
+    confidence: float
+    event_type: EventType = EventType.INFERENCE_COMPLETED
 
 
 @dataclass(slots=True, kw_only=True)
@@ -154,11 +311,24 @@ __all__ = [
     "EventType",
     "BeliefCreatedEvent",
     "BeliefUpdatedEvent",
+    "OpportunityIdentifiedEvent",
+    "OpportunityScoredEvent",
     "PlanProposedEvent",
     "PlanAbandonedEvent",
     "ExecutiveDecisionEvent",
+    "PolicyEvaluatedEvent",
+    "BudgetCheckedEvent",
     "ApprovalGrantedEvent",
+    "ApprovalDeniedEvent",
+    "ApprovalRequiredEvent",
+    "ActionApprovedEvent",
     "ActionAttemptedEvent",
+    "ActionSucceededEvent",
+    "ActionFailedEvent",
+    "OutcomeRecordedEvent",
+    "LedgerEntryPostedEvent",
+    "InferenceRequestedEvent",
+    "InferenceCompletedEvent",
     "ObservationCreatedEvent",
     "KernelStartingEvent",
     "KernelStartedEvent",

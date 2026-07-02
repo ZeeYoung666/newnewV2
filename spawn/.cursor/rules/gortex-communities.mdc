@@ -1,0 +1,32 @@
+---
+description: Gortex code intelligence — prefer graph tools over file reads
+alwaysApply: true
+---
+
+<!-- gortex:communities:start -->
+<!-- gortex:skills:start -->
+## Community Skills
+
+| Area | Description | Skill |
+|------|-------------|-------|
+| 2 Dirs Eventtype | 27 symbols | `/gortex-2-dirs-eventtype` |
+| 2 Dirs On Observation Created | 24 symbols | `/gortex-2-dirs-on-observation-created` |
+| 2 Dirs Test Core Event Models Are Impo | 23 symbols | `/gortex-2-dirs-test-core-event-models-are-impo` |
+| 1 Dirs Now | 22 symbols | `/gortex-1-dirs-now` |
+| 2 Dirs Src Perception Sensorregistry | 18 symbols | `/gortex-2-dirs-src-perception-sensorregistry` |
+| 2 Dirs Src Perception Perception | 14 symbols | `/gortex-2-dirs-src-perception-perception` |
+| 2 Dirs Src Perception Observation | 14 symbols | `/gortex-2-dirs-src-perception-observation` |
+| 2 Dirs Publish | 14 symbols | `/gortex-2-dirs-publish` |
+| 1 Dirs Record Observation | 10 symbols | `/gortex-1-dirs-record-observation` |
+| 1 Dirs Src Executive Opportunity | 8 symbols | `/gortex-1-dirs-src-executive-opportunity` |
+| 1 Dirs Src Executive Plan | 8 symbols | `/gortex-1-dirs-src-executive-plan` |
+| 1 Dirs Src World Model Beliefstore | 7 symbols | `/gortex-1-dirs-src-world-model-beliefstore` |
+| Src Kernel Unregister Subscriber | 6 symbols | `/gortex-src-kernel-unregister-subscriber` |
+| Src Kernel Kernel | 6 symbols | `/gortex-src-kernel-kernel` |
+| Src Kernel Eventlog | 6 symbols | `/gortex-src-kernel-eventlog` |
+| Src Kernel Register Subscriber | 6 symbols | `/gortex-src-kernel-register-subscriber` |
+| 1 Dirs Test Append And Read All | 5 symbols | `/gortex-1-dirs-test-append-and-read-all` |
+| 1 Dirs Init | 5 symbols | `/gortex-1-dirs-init` |
+<!-- gortex:skills:end -->
+
+<!-- gortex:communities:end -->
