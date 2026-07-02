@@ -11,7 +11,7 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, DefaultDict, Optional, Union
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import src.events as _events_module
 from src.events import (
@@ -210,6 +210,7 @@ class Kernel:
         self._stopping = False
         self._replaying = False
         self._replayed = False
+        self._active_correlation_id: Optional[UUID] = None
 
     def register_subscriber(self, event_type: EventType, subscriber: Subscriber) -> None:
         """Register a subscriber for a specific event type."""
@@ -280,9 +281,26 @@ class Kernel:
         return self.event_log.latest_sequence()
 
     def publish(self, event: Event) -> None:
-        """Queue an event for processing by the event loop, via the scheduler."""
+        """Queue an event for processing by the event loop, via the scheduler.
+
+        The Kernel is the sole owner of correlation_id propagation. A
+        publish that happens while no correlation is currently active mints
+        a fresh id (unless the event already carries one); every other
+        publish inherits whatever id is currently active. The active id is
+        cleared in `_dispatch_scheduled` once the scheduler's queue fully
+        drains, not when this method returns — after the kernel has
+        started, publish() for a non-lifecycle event schedules the task but
+        does not drain it itself, so the active id must survive until the
+        caller's own run_until_idle() call actually processes the cascade.
+        """
         if self._replaying:
             return
+        if event.correlation_id is None:
+            event.correlation_id = (
+                self._active_correlation_id if self._active_correlation_id is not None else uuid4()
+            )
+        if self._active_correlation_id is None:
+            self._active_correlation_id = event.correlation_id
         self.event_log.append(event)
         if event.event_type in self._TERMINAL_LIFECYCLE_TYPES:
             self._pending_terminal_lifecycle += 1
@@ -295,10 +313,14 @@ class Kernel:
         if event.event_type in self._TERMINAL_LIFECYCLE_TYPES:
             self._pending_terminal_lifecycle -= 1
         if self._stopping and event.event_type not in self._LIFECYCLE_TYPES:
+            if self.scheduler.pending_count() == 0:
+                self._active_correlation_id = None
             return
         self._dispatching = True
         self.dispatch(event)
         self._dispatching = False
+        if self.scheduler.pending_count() == 0:
+            self._active_correlation_id = None
 
     def process_next(self) -> None:
         """Process the next queued event, if any, by delegating to the scheduler."""
