@@ -1,15 +1,16 @@
 ---
 name: gortex-2-dirs-src-perception-observation
-description: "Work in the . +2 dirs · src.perception.Observation area — 14 symbols across 4 files (94% cohesion)"
+description: "Work in the . +2 dirs · src.perception.Observation area — 24 symbols across 5 files (94% cohesion)"
 ---
 
 # . +2 dirs · src.perception.Observation
 
-14 symbols | 4 files | 94% cohesion
+24 symbols | 5 files | 94% cohesion
 
 ## When to Use
 
 Use this skill when working on files in:
+- `external-call::dep:src.events.ObservationCreatedEvent`
 - `external-call::dep:src.perception.Observation`
 - `external-call::dep:src.perception.ObservationLog`
 - `src\perception\__init__.py`
@@ -19,21 +20,20 @@ Use this skill when working on files in:
 
 | File | Symbols |
 |------|---------|
+| `external-call::dep:src.events.ObservationCreatedEvent` | src.events.ObservationCreatedEvent |
 | `external-call::dep:src.perception.Observation` | src.perception.Observation |
 | `external-call::dep:src.perception.ObservationLog` | src.perception.ObservationLog |
-| `src\perception\__init__.py` | read_from, sequence_number, read_all, ObservationLog, __init__, ... |
-| `tests\test_perception.py` | ObservationLogTests, test_observation_carries_required_fields, test_observation_is_immutable, test_read_from_returns_suffix_without_mutating_entries, ObservationModelTests, ... |
+| `src\perception\__init__.py` | sequence_number, read_all, sensor_id, normalized_value, raw_source_type, ... |
+| `tests\test_perception.py` | test_observation_carries_required_fields, test_read_from_returns_suffix_without_mutating_entries, ObservationModelTests, test_observation_is_immutable, test_append_assigns_increasing_sequence_and_read_all_returns_in_order, ... |
 
 ## Entry Points
 
 - `tests\test_perception.py::ObservationLogTests.test_read_from_returns_suffix_without_mutating_entries`
-- `tests\test_perception.py::ObservationLogTests.test_append_assigns_increasing_sequence_and_read_all_returns_in_order`
-- `tests\test_perception.py::ObservationModelTests.test_observation_carries_required_fields`
 
 ## How to Explore
 
 ```
-get_communities with id: "community-46"
+get_communities with id: "community-102"
 smart_context with task: "understand . +2 dirs · src.perception.Observation", format: "gcx"
 find_usages with id: "tests\test_perception.py::ObservationLogTests.test_read_from_returns_suffix_without_mutating_entries", format: "gcx"
 ```

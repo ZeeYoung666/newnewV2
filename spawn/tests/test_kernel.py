@@ -1,14 +1,19 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from src.events import (
+    BeliefCreatedEvent,
     Event,
     EventType,
     KernelStartingEvent,
     KernelStartedEvent,
     KernelStoppingEvent,
     KernelStoppedEvent,
+    ObservationCreatedEvent,
 )
-from src.kernel import EventLog, Kernel, Subscriber
+from src.kernel import EventLog, Kernel, Scheduler, Subscriber
 
 
 class KernelTests(unittest.TestCase):
@@ -220,6 +225,191 @@ class KernelTests(unittest.TestCase):
                 EventType.KERNEL_STOPPED,
             ],
         )
+
+
+class KernelSchedulerDelegationTests(unittest.TestCase):
+    def test_kernel_owns_a_scheduler(self) -> None:
+        kernel = Kernel()
+
+        self.assertIsInstance(kernel.scheduler, Scheduler)
+
+    def test_publish_after_start_queues_on_scheduler_until_drained(self) -> None:
+        kernel = Kernel()
+        kernel.start()
+        received: list[Event] = []
+        kernel.register_subscriber(EventType.BELIEF_UPDATED, received.append)
+
+        event = Event(source_component="world_model", event_type=EventType.BELIEF_UPDATED)
+        kernel.publish(event)
+
+        self.assertEqual(kernel.scheduler.pending_count(), 1)
+        self.assertEqual(received, [])
+
+        kernel.run_until_idle()
+
+        self.assertEqual(kernel.scheduler.pending_count(), 0)
+        self.assertEqual(received, [event])
+
+    def test_process_next_delegates_exactly_one_task_to_scheduler(self) -> None:
+        kernel = Kernel()
+        kernel.start()
+        received: list[Event] = []
+        kernel.register_subscriber(EventType.BELIEF_UPDATED, received.append)
+        kernel.publish(Event(source_component="world_model", event_type=EventType.BELIEF_UPDATED))
+        kernel.publish(Event(source_component="world_model", event_type=EventType.BELIEF_UPDATED))
+
+        self.assertEqual(kernel.scheduler.pending_count(), 2)
+
+        kernel.process_next()
+
+        self.assertEqual(kernel.scheduler.pending_count(), 1)
+        self.assertEqual(len(received), 1)
+
+        kernel.process_next()
+
+        self.assertEqual(kernel.scheduler.pending_count(), 0)
+        self.assertEqual(len(received), 2)
+
+    def test_run_until_idle_drains_scheduler_not_just_kernel_state(self) -> None:
+        kernel = Kernel()
+        kernel.start()
+        kernel.publish(Event(source_component="world_model", event_type=EventType.BELIEF_UPDATED))
+        kernel.publish(Event(source_component="executive", event_type=EventType.PLAN_PROPOSED))
+
+        self.assertGreater(kernel.scheduler.pending_count(), 0)
+
+        kernel.run_until_idle()
+
+        self.assertEqual(kernel.scheduler.pending_count(), 0)
+
+
+class EventLogPersistenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.log_path = Path(self._tmpdir.name) / "data" / "events" / "events.jsonl"
+
+    def test_default_construction_still_works_and_is_isolated(self) -> None:
+        log_a = EventLog()
+        log_b = EventLog()
+
+        log_a.append(Event(source_component="world_model", event_type=EventType.BELIEF_UPDATED))
+
+        self.assertEqual(log_a.latest_sequence(), 1)
+        self.assertEqual(log_b.latest_sequence(), 0)
+        self.assertEqual(log_b.read_all(), [])
+
+    def test_log_survives_restart(self) -> None:
+        first = EventLog(path=self.log_path)
+        event_a = BeliefCreatedEvent(
+            source_component="world_model", belief_id="belief-1", claim="0.5", confidence=0.6, provenance="sensor-1"
+        )
+        event_b = ObservationCreatedEvent(
+            source_component="perception",
+            observation_id="observation-1",
+            sensor_id="sensor-1",
+            normalized_value=0.4,
+            confidence=0.8,
+            raw_source_type="market_feed",
+        )
+        first.append(event_a)
+        first.append(event_b)
+        del first  # simulate process exit
+
+        restarted = EventLog(path=self.log_path)
+
+        self.assertEqual(restarted.latest_sequence(), 2)
+        restored = [event for _, event in restarted.read_all()]
+        self.assertEqual(restored, [event_a, event_b])
+
+    def test_sequence_numbers_continue_after_restart(self) -> None:
+        first = EventLog(path=self.log_path)
+        first.append(Event(source_component="world_model", event_type=EventType.BELIEF_UPDATED))
+        first.append(Event(source_component="world_model", event_type=EventType.BELIEF_UPDATED))
+        del first
+
+        restarted = EventLog(path=self.log_path)
+        third_sequence = restarted.append(Event(source_component="world_model", event_type=EventType.BELIEF_UPDATED))
+
+        self.assertEqual(third_sequence, 3)
+        self.assertEqual(restarted.latest_sequence(), 3)
+        self.assertEqual([sequence for sequence, _ in restarted.read_all()], [1, 2, 3])
+
+    def test_ordering_preserved_across_restart(self) -> None:
+        first = EventLog(path=self.log_path)
+        events = [
+            Event(source_component=f"component-{i}", event_type=EventType.BELIEF_UPDATED) for i in range(5)
+        ]
+        for event in events:
+            first.append(event)
+        del first
+
+        restarted = EventLog(path=self.log_path)
+        restored = [event for _, event in restarted.read_all()]
+
+        self.assertEqual([event.source_component for event in restored], [event.source_component for event in events])
+
+    def test_no_entries_lost_across_restart(self) -> None:
+        first = EventLog(path=self.log_path)
+        for i in range(10):
+            first.append(Event(source_component=f"component-{i}", event_type=EventType.BELIEF_UPDATED))
+        del first
+
+        restarted = EventLog(path=self.log_path)
+
+        self.assertEqual(len(restarted.read_all()), 10)
+
+    def test_no_entries_overwritten_by_later_appends(self) -> None:
+        first = EventLog(path=self.log_path)
+        original = Event(source_component="world_model", event_type=EventType.BELIEF_UPDATED)
+        first.append(original)
+        del first
+
+        restarted = EventLog(path=self.log_path)
+        restarted.append(Event(source_component="executive", event_type=EventType.PLAN_PROPOSED))
+
+        first_entry = restarted.read_all()[0]
+        self.assertEqual(first_entry, (1, original))
+
+    def test_multiple_instances_reading_same_file_see_identical_history(self) -> None:
+        writer = EventLog(path=self.log_path)
+        writer.append(Event(source_component="world_model", event_type=EventType.BELIEF_UPDATED))
+        writer.append(Event(source_component="executive", event_type=EventType.PLAN_PROPOSED))
+
+        reader_a = EventLog(path=self.log_path)
+        reader_b = EventLog(path=self.log_path)
+
+        self.assertEqual(reader_a.read_all(), reader_b.read_all())
+        self.assertEqual(reader_a.latest_sequence(), reader_b.latest_sequence())
+        self.assertEqual(reader_a.read_all(), writer.read_all())
+
+    def test_append_flushes_to_disk_immediately(self) -> None:
+        log = EventLog(path=self.log_path)
+        log.append(Event(source_component="world_model", event_type=EventType.BELIEF_UPDATED))
+
+        raw_lines = self.log_path.read_text(encoding="utf-8").strip().splitlines()
+        self.assertEqual(len(raw_lines), 1)
+
+    def test_storage_format_is_one_json_line_per_event(self) -> None:
+        log = EventLog(path=self.log_path)
+        log.append(Event(source_component="world_model", event_type=EventType.BELIEF_UPDATED))
+        log.append(Event(source_component="executive", event_type=EventType.PLAN_PROPOSED))
+
+        raw_lines = self.log_path.read_text(encoding="utf-8").strip().splitlines()
+        self.assertEqual(len(raw_lines), 2)
+        for line in raw_lines:
+            json.loads(line)  # must not raise
+
+    def test_read_all_after_restart_returns_copy_not_shared_reference(self) -> None:
+        first = EventLog(path=self.log_path)
+        first.append(Event(source_component="world_model", event_type=EventType.BELIEF_UPDATED))
+        del first
+
+        restarted = EventLog(path=self.log_path)
+        snapshot = restarted.read_all()
+        snapshot.append((99, Event(source_component="rogue", event_type=EventType.BELIEF_UPDATED)))
+
+        self.assertEqual(len(restarted.read_all()), 1)
 
 
 if __name__ == "__main__":

@@ -19,21 +19,14 @@ Use this skill when working on files in:
 | File | Symbols |
 |------|---------|
 | `external-call::dep:src.perception.SensorRegistry` | src.perception.SensorRegistry |
-| `src\perception\__init__.py` | sensor_id, __init__, source_type, sensor_id, register_sensor, ... |
-| `tests\test_perception.py` | SensorRegistryTests, test_is_active_returns_false_for_unknown_sensor, test_unregister_sensor_removes_it, test_get_metadata_raises_for_unknown_sensor, test_registering_duplicate_sensor_id_raises, ... |
-
-## Entry Points
-
-- `tests\test_perception.py::SensorRegistryTests.test_register_sensor_stores_metadata_and_marks_active`
-- `tests\test_perception.py::SensorRegistryTests.test_unregister_sensor_removes_it`
-- `tests\test_perception.py::SensorRegistryTests.test_registering_duplicate_sensor_id_raises`
+| `src\perception\__init__.py` | SensorMetadata, SensorRegistry, sensor_id, sensor_id, get_metadata, ... |
+| `tests\test_perception.py` | test_get_metadata_raises_for_unknown_sensor, test_is_active_returns_false_for_unknown_sensor, test_unregister_sensor_removes_it, test_registering_duplicate_sensor_id_raises, test_register_sensor_stores_metadata_and_marks_active, ... |
 
 ## How to Explore
 
 ```
-get_communities with id: "community-48"
+get_communities with id: "community-104"
 smart_context with task: "understand . +2 dirs · src.perception.SensorRegistry", format: "gcx"
-find_usages with id: "tests\test_perception.py::SensorRegistryTests.test_register_sensor_stores_metadata_and_marks_active", format: "gcx"
 ```
 
 _`format: "gcx"` returns the [GCX1 compact wire format](../../docs/wire-format.md) — round-trippable, ~27% fewer tokens than JSON. Drop it for JSON output; agents using `@gortex/wire` or the Go `github.com/gortexhq/gcx-go` package decode either._
