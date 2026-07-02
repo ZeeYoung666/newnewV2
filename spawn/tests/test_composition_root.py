@@ -134,6 +134,18 @@ class BootstrapCycleTests(unittest.TestCase):
             ],
         )
 
+    def test_full_cycle_shares_one_correlation_id_across_every_event(self) -> None:
+        start_sequence = self.organism.kernel.event_log.latest_sequence() + 1
+
+        main.run_bootstrap_cycle(self.organism)
+
+        cascade = self.organism.kernel.event_log.read_from(start_sequence)
+        correlation_ids = {event.correlation_id for _, event in cascade}
+
+        self.assertEqual(len(cascade), 18)
+        self.assertEqual(len(correlation_ids), 1)
+        self.assertIsNotNone(next(iter(correlation_ids)))
+
 
 class MainEntrypointTests(unittest.TestCase):
     def test_main_boots_the_organism_and_runs_one_full_cycle(self) -> None:
