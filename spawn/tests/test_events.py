@@ -3,10 +3,12 @@ import unittest
 from src.events import (
     ActionAttemptedEvent,
     ApprovalGrantedEvent,
+    BeliefCreatedEvent,
     BeliefUpdatedEvent,
     Event,
     EventType,
     ExecutiveDecisionEvent,
+    ObservationCreatedEvent,
     PlanAbandonedEvent,
     PlanProposedEvent,
 )
@@ -50,6 +52,21 @@ class EventModelTests(unittest.TestCase):
             tool_name="send_email",
             attempt=1,
         )
+        observation_event = ObservationCreatedEvent(
+            source_component="perception",
+            observation_id="observation-1",
+            sensor_id="sensor-1",
+            normalized_value=0.5,
+            confidence=0.9,
+            raw_source_type="market_feed",
+        )
+        belief_created_event = BeliefCreatedEvent(
+            source_component="world_model",
+            belief_id="belief-1",
+            claim="0.5",
+            confidence=0.6,
+            provenance="sensor-1",
+        )
 
         self.assertIsInstance(belief_event, Event)
         self.assertEqual(belief_event.event_type, EventType.BELIEF_UPDATED)
@@ -58,6 +75,8 @@ class EventModelTests(unittest.TestCase):
         self.assertEqual(decision_event.event_type, EventType.PLAN_SELECTED)
         self.assertEqual(approval_event.event_type, EventType.APPROVAL_GRANTED)
         self.assertEqual(execution_event.event_type, EventType.ACTION_ATTEMPTED)
+        self.assertEqual(observation_event.event_type, EventType.OBSERVATION_CREATED)
+        self.assertEqual(belief_created_event.event_type, EventType.BELIEF_CREATED)
         self.assertEqual(belief_event.event_version, 1)
         self.assertEqual(planning_event.event_version, 1)
 
