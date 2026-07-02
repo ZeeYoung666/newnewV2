@@ -147,16 +147,13 @@ class BootstrapCycleTests(unittest.TestCase):
         self.assertIsNotNone(next(iter(correlation_ids)))
 
     def test_two_independent_cycles_receive_different_correlation_ids(self) -> None:
-        before_first = len(self.organism.kernel.event_log.read_all())
+        first_start = self.organism.kernel.event_log.latest_sequence() + 1
         main.run_bootstrap_cycle(self.organism)
-        after_first = len(self.organism.kernel.event_log.read_all())
+        first_cascade = [event for _, event in self.organism.kernel.event_log.read_from(first_start)]
 
+        second_start = self.organism.kernel.event_log.latest_sequence() + 1
         main.run_bootstrap_cycle(self.organism)
-        after_second = len(self.organism.kernel.event_log.read_all())
-
-        all_events = [event for _, event in self.organism.kernel.event_log.read_all()]
-        first_cascade = all_events[before_first:after_first]
-        second_cascade = all_events[after_first:after_second]
+        second_cascade = [event for _, event in self.organism.kernel.event_log.read_from(second_start)]
 
         first_ids = {event.correlation_id for event in first_cascade}
         second_ids = {event.correlation_id for event in second_cascade}
