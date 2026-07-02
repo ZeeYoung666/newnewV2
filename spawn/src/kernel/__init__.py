@@ -10,7 +10,7 @@ import typing
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, DefaultDict, Union
+from typing import Callable, DefaultDict, Optional, Union
 from uuid import UUID
 
 import src.events as _events_module
@@ -199,15 +199,17 @@ class Kernel:
         EventType.KERNEL_STOPPED,
     }
 
-    def __init__(self) -> None:
+    def __init__(self, event_log: Optional[EventLog] = None) -> None:
         self._subscribers: DefaultDict[EventType, list[Subscriber]] = defaultdict(list)
-        self.event_log = EventLog()
+        self.event_log = event_log if event_log is not None else EventLog()
         self.scheduler = Scheduler()
         self._pending_terminal_lifecycle = 0
         self._running = False
         self._started = False
         self._dispatching = False
         self._stopping = False
+        self._replaying = False
+        self._replayed = False
 
     def register_subscriber(self, event_type: EventType, subscriber: Subscriber) -> None:
         """Register a subscriber for a specific event type."""
@@ -228,8 +230,10 @@ class Kernel:
         self.unregister_subscriber(event_type, subscriber)
 
     def start(self) -> None:
-        """Start the kernel event loop."""
+        """Start the kernel event loop, replaying any persisted history first."""
         if not self._running:
+            if not self._replayed:
+                self.replay()
             self._stopping = False
             self.publish(KernelStartingEvent(source_component="kernel"))
             self._running = True
@@ -249,8 +253,36 @@ class Kernel:
         """Return whether the kernel is currently running."""
         return self._running
 
+    def replay(self) -> int:
+        """Reconstruct component state by re-dispatching every already-persisted
+        event through the normal typed-event handlers, in original sequence
+        order. Must run before the kernel starts, and runs at most once.
+
+        Events a handler re-publishes while this runs are not re-appended to
+        the log or re-dispatched here: each one is already its own entry in
+        the log and gets visited directly by this same loop when its own
+        sequence number is reached. Suppressing the nested publish is what
+        keeps every historical event dispatched exactly once and leaves the
+        log with no duplicates.
+        """
+        if self._started:
+            raise RuntimeError("cannot replay after the kernel has started")
+        if self._replayed:
+            raise RuntimeError("replay has already run for this kernel")
+
+        self._replaying = True
+        try:
+            for _, event in self.event_log.read_all():
+                self.dispatch(event)
+        finally:
+            self._replaying = False
+        self._replayed = True
+        return self.event_log.latest_sequence()
+
     def publish(self, event: Event) -> None:
         """Queue an event for processing by the event loop, via the scheduler."""
+        if self._replaying:
+            return
         self.event_log.append(event)
         if event.event_type in self._TERMINAL_LIFECYCLE_TYPES:
             self._pending_terminal_lifecycle += 1

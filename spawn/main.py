@@ -9,6 +9,7 @@ Execution -> Outcome -> Memory flow using only typed events.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 from src.executive import Executive
 from src.executor import Executor
@@ -44,14 +45,19 @@ class Organism:
     inference_port: InferencePort
 
 
-def build_organism() -> Organism:
+def build_organism(kernel: Optional[Kernel] = None) -> Organism:
     """Construct one Kernel and exactly one instance of every component against it.
 
     Each component registers its own event subscriptions inside its
     constructor, so calling each constructor exactly once here registers
     every subscription exactly once.
+
+    Pass an existing ``Kernel`` (wired to a persistent EventLog) to rebuild
+    the organism against previously recorded history; its Kernel.start()
+    will replay that history before normal scheduling begins. With no
+    argument, a fresh in-memory Kernel is constructed for a first boot.
     """
-    kernel = Kernel()
+    kernel = kernel if kernel is not None else Kernel()
 
     perception = Perception(kernel)
     world_model = WorldModel(kernel)
