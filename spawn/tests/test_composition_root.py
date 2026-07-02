@@ -146,6 +146,27 @@ class BootstrapCycleTests(unittest.TestCase):
         self.assertEqual(len(correlation_ids), 1)
         self.assertIsNotNone(next(iter(correlation_ids)))
 
+    def test_two_independent_cycles_receive_different_correlation_ids(self) -> None:
+        before_first = len(self.organism.kernel.event_log.read_all())
+        main.run_bootstrap_cycle(self.organism)
+        after_first = len(self.organism.kernel.event_log.read_all())
+
+        main.run_bootstrap_cycle(self.organism)
+        after_second = len(self.organism.kernel.event_log.read_all())
+
+        all_events = [event for _, event in self.organism.kernel.event_log.read_all()]
+        first_cascade = all_events[before_first:after_first]
+        second_cascade = all_events[after_first:after_second]
+
+        first_ids = {event.correlation_id for event in first_cascade}
+        second_ids = {event.correlation_id for event in second_cascade}
+
+        self.assertEqual(len(first_cascade), 18)
+        self.assertEqual(len(second_cascade), 18)
+        self.assertEqual(len(first_ids), 1)
+        self.assertEqual(len(second_ids), 1)
+        self.assertNotEqual(first_ids, second_ids)
+
 
 class MainEntrypointTests(unittest.TestCase):
     def test_main_boots_the_organism_and_runs_one_full_cycle(self) -> None:
