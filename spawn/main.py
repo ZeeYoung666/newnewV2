@@ -70,6 +70,7 @@ def build_organism(kernel: Optional[Kernel] = None) -> Organism:
     provider_registry.register("mock", MockInferenceProvider())
     provider_registry.set_active("mock")
     inference_port = InferencePort(kernel, provider_registry)
+    executive.attach_inference_port(inference_port)
 
     return Organism(
         kernel=kernel,
