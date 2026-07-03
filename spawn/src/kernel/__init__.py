@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import heapq
 import json
 import os
 import tempfile
@@ -208,11 +209,29 @@ class Scheduler:
     callback calling schedule() on itself) appends to the back of the queue
     rather than recursing, so run_until_idle drains new work in later
     iterations of its own loop, never via a nested call stack.
+
+    Timers use logical time, not the wall clock: the scheduler keeps an
+    integer clock that only moves when advance_time() is called, so timer
+    behavior is fully deterministic — no threads, no sleeping, no reading
+    the system clock. schedule_at() parks a callback in a timer table until
+    the clock reaches its due time, at which point advance_time() releases
+    it into the same FIFO ready queue that schedule() feeds. Task ids come
+    from one shared counter, so ids double as the FIFO tie-break: timers
+    due at the same time release in the order they were scheduled.
     """
 
     def __init__(self) -> None:
         self._queue: list[tuple[int, Callable[[], None]]] = []
         self._next_task_id = 1
+        self._now = 0
+        # Min-heap of (due_time, task_id, callback); task_id is unique, so
+        # heap comparisons never reach the (non-comparable) callback.
+        self._timers: list[tuple[int, int, Callable[[], None]]] = []
+
+    @property
+    def now(self) -> int:
+        """The current logical time. Starts at 0 and only advance_time() moves it."""
+        return self._now
 
     def schedule(self, callback: Callable[[], None]) -> int:
         """Queue a callback to run exactly once, in FIFO order. Returns its task id."""
@@ -221,11 +240,53 @@ class Scheduler:
         self._queue.append((task_id, callback))
         return task_id
 
+    def schedule_at(self, due_time: int, callback: Callable[[], None]) -> int:
+        """Queue a callback to run exactly once, at or after the given logical time.
+
+        A due time at or before the current clock is already due, so the
+        callback joins the back of the ready queue immediately — behind any
+        work already queued, preserving FIFO. A future due time parks the
+        callback in the timer table until advance_time() reaches it.
+        Returns a task id usable with cancel() either way.
+        """
+        task_id = self._next_task_id
+        self._next_task_id += 1
+        if due_time <= self._now:
+            self._queue.append((task_id, callback))
+        else:
+            heapq.heappush(self._timers, (due_time, task_id, callback))
+        return task_id
+
+    def advance_time(self, now: int) -> None:
+        """Move the logical clock forward, releasing every timer due at or
+        before the new time into the ready queue.
+
+        Timers release in (due_time, task_id) order: earlier due times
+        first, and FIFO among timers sharing a due time. Released work is
+        only made ready, never executed here — run_next()/run_until_idle()
+        remain the sole places callbacks run. The clock never moves
+        backwards; that would make "already due" ambiguous.
+        """
+        if now < self._now:
+            raise ValueError(f"cannot move logical time backwards ({self._now} -> {now})")
+        self._now = now
+        while self._timers and self._timers[0][0] <= now:
+            _, task_id, callback = heapq.heappop(self._timers)
+            self._queue.append((task_id, callback))
+
     def cancel(self, task_id: int) -> bool:
-        """Remove a still-pending task so it never executes. Returns whether it was found."""
+        """Remove a still-pending task so it never executes. Returns whether it was found.
+
+        Covers both ready tasks and timers that have not yet come due.
+        """
         for index, (existing_id, _) in enumerate(self._queue):
             if existing_id == task_id:
                 del self._queue[index]
+                return True
+        for index, (_, existing_id, _) in enumerate(self._timers):
+            if existing_id == task_id:
+                del self._timers[index]
+                heapq.heapify(self._timers)
                 return True
         return False
 
@@ -243,8 +304,24 @@ class Scheduler:
             self.run_next()
 
     def pending_count(self) -> int:
-        """Return how many tasks are still queued (cancelled tasks are removed immediately)."""
+        """Return how many tasks are ready to run (cancelled tasks are removed immediately).
+
+        Timers that have not yet come due are excluded — they are not
+        runnable until advance_time() releases them, and counting them here
+        would make run_until_idle spin waiting on time that only an
+        explicit advance_time() call can supply. See timer_count().
+        """
         return len(self._queue)
+
+    def timer_count(self) -> int:
+        """Return how many timers are parked waiting for their due time."""
+        return len(self._timers)
+
+    def next_due_time(self) -> Optional[int]:
+        """Return the earliest pending timer's due time, or None if no timers are parked."""
+        if not self._timers:
+            return None
+        return self._timers[0][0]
 
 
 class Kernel:
