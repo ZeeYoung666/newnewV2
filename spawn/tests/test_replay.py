@@ -112,6 +112,27 @@ class ReplayOnStartTests(unittest.TestCase):
 
         self.assertEqual(observed_order, original_order)
 
+    def test_replay_preserves_original_correlation_ids(self) -> None:
+        _boot_fresh(self.log_path)
+
+        replay_log = EventLog(path=self.log_path)
+        original_ids = [event.correlation_id for _, event in replay_log.read_all()]
+        self.assertGreater(len(original_ids), 0)
+        self.assertTrue(all(cid is not None for cid in original_ids))
+
+        observed_ids: list = []
+        kernel = Kernel(event_log=replay_log)
+
+        def record(event: object) -> None:
+            observed_ids.append(event.correlation_id)  # type: ignore[attr-defined]
+
+        for event_type in EventType:
+            kernel.register_subscriber(event_type, record)
+
+        kernel.replay()
+
+        self.assertEqual(observed_ids, original_ids)
+
     def test_replay_is_deterministic_across_multiple_restarts(self) -> None:
         _boot_fresh(self.log_path)
 
