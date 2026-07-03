@@ -1,7 +1,11 @@
-"""Executive: generates opportunities, scores them, and proposes plans.
+"""Executive: generates opportunities, scores them, ranks them, and proposes plans.
 
 Owns the goal tree, opportunity store, plan store, and decision records.
-The Executive proposes only — it does not approve and does not execute.
+The Executive proposes only — it does not approve, does not reserve budget,
+does not touch Governor state, and does not execute. Its deliberation pipeline
+ranks competing opportunities, estimates their expected value through the
+Inference Port, allocates attention and capital across them, and commits to a
+single winning plan while abandoning the rest.
 """
 
 from __future__ import annotations
@@ -15,15 +19,26 @@ from src.events import (
     BeliefCreatedEvent,
     BeliefUpdatedEvent,
     EventType,
+    ExecutiveDecisionEvent,
     OpportunityIdentifiedEvent,
     OpportunityScoredEvent,
+    PlanAbandonedEvent,
     PlanProposedEvent,
 )
+from src.inference import InferencePort, InferenceRequest
 from src.kernel import Kernel
 
 EXPECTED_VALUE_PER_CONFIDENCE = 100.0
 ATTENTION_COST_BASELINE = 1.0
 CAPITAL_COST_FRACTION = 0.1
+
+# Deliberation tuning. Expected value is re-estimated through the Inference
+# Port (raw value scaled by the provider's judgment); attention and capital a
+# plan demands scale with that estimate, so the more an opportunity is worth
+# the more of each scarce budget it asks for.
+EV_ESTIMATION_PURPOSE = "estimate_expected_value"
+ATTENTION_DEMAND_FRACTION = 0.05
+CAPITAL_DEMAND_FRACTION = 0.1
 
 
 @dataclass(slots=True, kw_only=True, frozen=True)
@@ -70,6 +85,45 @@ class DecisionRecord:
     subject_id: str
     rationale: str
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass(slots=True, kw_only=True, frozen=True)
+class Allocation:
+    """How much attention and capital deliberation apportioned to one candidate.
+
+    ``funded`` is True when the candidate fit within the attention and capital
+    still available when it was reached in ranked order; a funded candidate is
+    executable and eligible to win, an unfunded one is discarded.
+    """
+
+    plan_id: str
+    opportunity_id: str
+    estimated_value: float
+    attention_allocated: float
+    capital_allocated: float
+    funded: bool
+
+
+@dataclass(slots=True, kw_only=True, frozen=True)
+class DeliberationResult:
+    """The outcome of one deliberation pass over the competing candidates."""
+
+    winning_plan_id: Optional[str]
+    ranked_plan_ids: tuple[str, ...]
+    abandoned_plan_ids: tuple[str, ...]
+    allocations: tuple[Allocation, ...]
+
+
+@dataclass(slots=True, kw_only=True, frozen=True)
+class _Candidate:
+    """Working state for a single competing plan during one deliberation pass."""
+
+    sequence: int
+    plan: Plan
+    opportunity: Opportunity
+    estimated_value: float
+    attention_demand: float
+    capital_demand: float
 
 
 class GoalStore:
@@ -147,14 +201,24 @@ class DecisionRecordStore:
 class Executive:
     """Reacts to belief events by proposing opportunities and plans. Proposes only."""
 
-    def __init__(self, kernel: Kernel) -> None:
+    def __init__(self, kernel: Kernel, inference_port: Optional[InferencePort] = None) -> None:
         self._kernel = kernel
+        self._inference_port = inference_port
         self.goal_store = GoalStore()
         self.opportunity_store = OpportunityStore()
         self.plan_store = PlanStore()
         self.decision_record_store = DecisionRecordStore()
+        # Plans proposed but not yet decided, oldest first. Deliberation
+        # ranks and clears these; the list order is the deterministic FIFO
+        # tie-break among equally valued candidates.
+        self._pending_plan_ids: list[str] = []
         kernel.register_subscriber(EventType.BELIEF_CREATED, self._on_belief_created)
         kernel.register_subscriber(EventType.BELIEF_UPDATED, self._on_belief_updated)
+        # Decision records for committed and abandoned plans are appended in
+        # response to the emitted events, not inside deliberate() itself, so a
+        # full replay of the log reconstructs them exactly as a live run did.
+        kernel.register_subscriber(EventType.PLAN_SELECTED, self._on_plan_selected)
+        kernel.register_subscriber(EventType.PLAN_ABANDONED, self._on_plan_abandoned)
         kernel.register_snapshot_source(
             "executive.opportunities", Opportunity, self.opportunity_store.read_all, self._restore_opportunities
         )
@@ -246,6 +310,7 @@ class Executive:
             capital_cost=round(opportunity.expected_value * CAPITAL_COST_FRACTION, 4),
         )
         self.plan_store.append(plan)
+        self._pending_plan_ids.append(plan.plan_id)
         self._kernel.publish(
             PlanProposedEvent(
                 source_component="executive",
@@ -271,6 +336,206 @@ class Executive:
             )
         )
 
+    def attach_inference_port(self, inference_port: InferencePort) -> None:
+        """Wire the Inference Port used to estimate expected value.
+
+        Kept separate from construction so the composition root can build the
+        Executive before the port without an ordering constraint; the
+        organism attaches it once both exist.
+        """
+        self._inference_port = inference_port
+
+    def pending_plan_ids(self) -> list[str]:
+        """Plans proposed but not yet committed or abandoned, oldest first."""
+        return list(self._pending_plan_ids)
+
+    def deliberate(self, *, available_attention: float, available_capital: float) -> Optional[DeliberationResult]:
+        """Run one deliberation pass over every pending candidate plan.
+
+        Ranks the competing opportunities by Inference-Port-estimated expected
+        value, allocates the shared attention and capital budgets across them
+        in ranked order, commits to the single highest-value executable plan
+        with an ``ExecutiveDecisionEvent``, and abandons every other candidate
+        with a ``PlanAbandonedEvent``. Returns ``None`` when nothing is pending.
+
+        This never reserves budget, approves, or executes — the caller passes
+        in the currently available attention and capital, and the Executive
+        only proposes a commitment. Enforcement stays with the Governor.
+        """
+        if self._inference_port is None:
+            raise RuntimeError("deliberation requires an inference port; call attach_inference_port first")
+        if not self._pending_plan_ids:
+            return None
+
+        # Step 1 + 2: build candidates, estimating expected value through the
+        # Inference Port. Enumeration order is the FIFO tie-break for ranking.
+        candidates = [
+            self._build_candidate(sequence, plan_id)
+            for sequence, plan_id in enumerate(self._pending_plan_ids)
+        ]
+
+        # Step 1: rank competing opportunities — highest estimated value first,
+        # oldest-proposed first on ties, so ranking is fully deterministic.
+        ranked = sorted(candidates, key=lambda c: (-c.estimated_value, c.sequence))
+
+        # Step 3 + 4: allocate attention across, then capital within, the
+        # available budgets. Walking in ranked order spends each scarce budget
+        # on the most valuable opportunities first; a candidate that no longer
+        # fits is left unfunded and therefore not executable.
+        remaining_attention = available_attention
+        remaining_capital = available_capital
+        allocations: list[Allocation] = []
+        funded_reasons: dict[str, str] = {}
+        winner_plan_id: Optional[str] = None
+        for candidate in ranked:
+            attention_ok = candidate.attention_demand <= remaining_attention
+            capital_ok = candidate.capital_demand <= remaining_capital
+            funded = attention_ok and capital_ok
+            if funded:
+                remaining_attention -= candidate.attention_demand
+                remaining_capital -= candidate.capital_demand
+                # Step 5: the first funded candidate in value-descending order
+                # is the highest-value executable plan — the winner.
+                if winner_plan_id is None:
+                    winner_plan_id = candidate.plan.plan_id
+            else:
+                funded_reasons[candidate.plan.plan_id] = self._shortfall_reason(attention_ok, capital_ok)
+            allocations.append(
+                Allocation(
+                    plan_id=candidate.plan.plan_id,
+                    opportunity_id=candidate.opportunity.opportunity_id,
+                    estimated_value=candidate.estimated_value,
+                    attention_allocated=candidate.attention_demand if funded else 0.0,
+                    capital_allocated=candidate.capital_demand if funded else 0.0,
+                    funded=funded,
+                )
+            )
+
+        allocation_by_plan = {allocation.plan_id: allocation for allocation in allocations}
+
+        # Step 6: commit to the winner. Step 7: abandon every other candidate.
+        # Emit in ranked order for a deterministic, auditable event sequence.
+        abandoned_plan_ids: list[str] = []
+        for candidate in ranked:
+            plan_id = candidate.plan.plan_id
+            allocation = allocation_by_plan[plan_id]
+            if plan_id == winner_plan_id:
+                self._commit_plan(candidate, allocation, len(candidates))
+            else:
+                abandoned_plan_ids.append(plan_id)
+                self._abandon_plan(candidate, allocation, winner_plan_id, funded_reasons.get(plan_id))
+
+        self._pending_plan_ids.clear()
+        return DeliberationResult(
+            winning_plan_id=winner_plan_id,
+            ranked_plan_ids=tuple(c.plan.plan_id for c in ranked),
+            abandoned_plan_ids=tuple(abandoned_plan_ids),
+            allocations=tuple(allocations),
+        )
+
+    def _build_candidate(self, sequence: int, plan_id: str) -> _Candidate:
+        plan = self.plan_store.get(plan_id)
+        opportunity = self.opportunity_store.get(plan.opportunity_id)
+        estimated_value = self._estimate_expected_value(opportunity)
+        return _Candidate(
+            sequence=sequence,
+            plan=plan,
+            opportunity=opportunity,
+            estimated_value=estimated_value,
+            attention_demand=round(estimated_value * ATTENTION_DEMAND_FRACTION, 4),
+            capital_demand=round(estimated_value * CAPITAL_DEMAND_FRACTION, 4),
+        )
+
+    def _estimate_expected_value(self, opportunity: Opportunity) -> float:
+        """Estimate an opportunity's expected value through the Inference Port.
+
+        The provider's judgment (its returned confidence) scales the
+        opportunity's raw expected value, so the estimate genuinely flows
+        through the swappable port rather than a hardcoded formula.
+        """
+        assert self._inference_port is not None  # guarded by deliberate()
+        request = InferenceRequest(
+            request_id=str(uuid4()),
+            requester="executive",
+            purpose=EV_ESTIMATION_PURPOSE,
+            context={
+                "opportunity_id": opportunity.opportunity_id,
+                "raw_expected_value": str(opportunity.expected_value),
+                "confidence": str(opportunity.confidence),
+            },
+            constraints=(),
+        )
+        response = self._inference_port.infer(request)
+        return round(opportunity.expected_value * response.confidence, 4)
+
+    @staticmethod
+    def _shortfall_reason(attention_ok: bool, capital_ok: bool) -> str:
+        if not attention_ok and not capital_ok:
+            return "insufficient attention and capital allocation"
+        if not attention_ok:
+            return "insufficient attention allocation"
+        return "insufficient capital allocation"
+
+    def _commit_plan(self, candidate: _Candidate, allocation: Allocation, candidate_count: int) -> None:
+        rationale = (
+            f"highest-value executable plan among {candidate_count} candidate(s): "
+            f"estimated_value={allocation.estimated_value} "
+            f"attention_allocated={allocation.attention_allocated} "
+            f"capital_allocated={allocation.capital_allocated}"
+        )
+        self._kernel.publish(
+            ExecutiveDecisionEvent(
+                source_component="executive",
+                decision_id=str(uuid4()),
+                plan_id=candidate.plan.plan_id,
+                rationale=rationale,
+            )
+        )
+
+    def _abandon_plan(
+        self,
+        candidate: _Candidate,
+        allocation: Allocation,
+        winner_plan_id: Optional[str],
+        shortfall_reason: Optional[str],
+    ) -> None:
+        if not allocation.funded and shortfall_reason is not None:
+            reason = f"{shortfall_reason}: estimated_value={allocation.estimated_value}"
+        elif winner_plan_id is not None:
+            reason = (
+                f"not selected: estimated_value={allocation.estimated_value} "
+                f"ranked below winning plan {winner_plan_id}"
+            )
+        else:
+            reason = f"no executable plan selected: estimated_value={allocation.estimated_value}"
+        self._kernel.publish(
+            PlanAbandonedEvent(
+                source_component="executive",
+                plan_id=candidate.plan.plan_id,
+                reason=reason,
+            )
+        )
+
+    def _on_plan_selected(self, event: ExecutiveDecisionEvent) -> None:
+        self.decision_record_store.append(
+            DecisionRecord(
+                decision_id=str(uuid4()),
+                decision_type="plan_selected",
+                subject_id=event.plan_id,
+                rationale=event.rationale,
+            )
+        )
+
+    def _on_plan_abandoned(self, event: PlanAbandonedEvent) -> None:
+        self.decision_record_store.append(
+            DecisionRecord(
+                decision_id=str(uuid4()),
+                decision_type="plan_abandoned",
+                subject_id=event.plan_id,
+                rationale=event.reason,
+            )
+        )
+
 
 __all__ = [
     "Goal",
@@ -281,5 +546,7 @@ __all__ = [
     "PlanStore",
     "DecisionRecord",
     "DecisionRecordStore",
+    "Allocation",
+    "DeliberationResult",
     "Executive",
 ]
