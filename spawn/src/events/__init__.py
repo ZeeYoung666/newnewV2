@@ -24,6 +24,9 @@ class EventType(str, Enum):
     APPROVAL_GRANTED = "approval.granted"
     APPROVAL_DENIED = "approval.denied"
     APPROVAL_REQUIRED = "approval.required"
+    CONSTITUTION_AMENDMENT_PROPOSED = "constitution.amendment_proposed"
+    CONSTITUTION_AMENDED = "constitution.amended"
+    CONSTITUTION_AMENDMENT_REJECTED = "constitution.amendment_rejected"
     ACTION_APPROVED = "action.approved"
     ACTION_ATTEMPTED = "action.attempted"
     ACTION_SUCCEEDED = "action.succeeded"
@@ -182,6 +185,40 @@ class ApprovalRequiredEvent(Event):
 
 
 @dataclass(slots=True, kw_only=True)
+class ConstitutionAmendmentProposedEvent(Event):
+    """Represents a candidate constitution proposed for owner approval."""
+
+    amendment_id: str
+    constitution_id: str
+    previous_constitution_id: Optional[str]
+    version: int
+    rules: tuple[str, ...]
+    justification: str
+    event_type: EventType = EventType.CONSTITUTION_AMENDMENT_PROPOSED
+
+
+@dataclass(slots=True, kw_only=True)
+class ConstitutionAmendedEvent(Event):
+    """Represents an owner-approved amendment becoming the active constitution."""
+
+    amendment_id: str
+    constitution_id: str
+    version: int
+    approved_by: str
+    event_type: EventType = EventType.CONSTITUTION_AMENDED
+
+
+@dataclass(slots=True, kw_only=True)
+class ConstitutionAmendmentRejectedEvent(Event):
+    """Represents an owner rejecting a proposed constitutional amendment."""
+
+    amendment_id: str
+    constitution_id: str
+    reason: str
+    event_type: EventType = EventType.CONSTITUTION_AMENDMENT_REJECTED
+
+
+@dataclass(slots=True, kw_only=True)
 class ActionAttemptedEvent(Event):
     """Represents an execution attempt by the executor."""
 
@@ -321,6 +358,9 @@ __all__ = [
     "ApprovalGrantedEvent",
     "ApprovalDeniedEvent",
     "ApprovalRequiredEvent",
+    "ConstitutionAmendmentProposedEvent",
+    "ConstitutionAmendedEvent",
+    "ConstitutionAmendmentRejectedEvent",
     "ActionApprovedEvent",
     "ActionAttemptedEvent",
     "ActionSucceededEvent",

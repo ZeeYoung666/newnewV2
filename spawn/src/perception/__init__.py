@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
 from src.events import ObservationCreatedEvent
@@ -84,6 +85,80 @@ class ObservationLog:
         return [(sequence, observation) for sequence, observation in self._entries if sequence >= sequence_number]
 
 
+@dataclass(slots=True, kw_only=True, frozen=True)
+class NormalizedReading:
+    """The canonical (value, confidence) pair an adapter extracts from a raw payload."""
+
+    normalized_value: float
+    confidence: float
+
+
+@runtime_checkable
+class ObservationAdapter(Protocol):
+    """Normalizes one raw sensor payload format into a NormalizedReading."""
+
+    def accepts(self, payload: object) -> bool:
+        """Return whether this adapter knows how to normalize the given payload."""
+        ...
+
+    def normalize(self, payload: object) -> NormalizedReading:
+        """Extract a NormalizedReading from the payload. Only called if accepts() returned True."""
+        ...
+
+
+class FlatValueAdapter:
+    """Normalizes payloads shaped like {"value": float, "confidence": float}."""
+
+    def accepts(self, payload: object) -> bool:
+        return isinstance(payload, dict) and "value" in payload and "confidence" in payload
+
+    def normalize(self, payload: object) -> NormalizedReading:
+        assert isinstance(payload, dict)
+        return NormalizedReading(
+            normalized_value=float(payload["value"]),
+            confidence=float(payload["confidence"]),
+        )
+
+
+class NestedReadingAdapter:
+    """Normalizes payloads shaped like {"reading": {"amount": float, "quality": float}}."""
+
+    def accepts(self, payload: object) -> bool:
+        if not isinstance(payload, dict) or "reading" not in payload:
+            return False
+        reading = payload["reading"]
+        return isinstance(reading, dict) and "amount" in reading and "quality" in reading
+
+    def normalize(self, payload: object) -> NormalizedReading:
+        assert isinstance(payload, dict)
+        reading = payload["reading"]
+        return NormalizedReading(
+            normalized_value=float(reading["amount"]),
+            confidence=float(reading["quality"]),
+        )
+
+
+class AdapterRegistry:
+    """Ordered chain of ObservationAdapters. The first adapter that accepts a payload normalizes it."""
+
+    def __init__(self) -> None:
+        self._adapters: list[ObservationAdapter] = []
+
+    def register(self, adapter: ObservationAdapter) -> None:
+        """Append an adapter to the end of the selection chain."""
+        self._adapters.append(adapter)
+
+    def normalize(self, payload: object) -> NormalizedReading:
+        """Return the NormalizedReading from the first adapter that accepts payload.
+
+        Raises ValueError if no registered adapter accepts the payload.
+        """
+        for adapter in self._adapters:
+            if adapter.accepts(payload):
+                return adapter.normalize(payload)
+        raise ValueError(f"no adapter accepts payload: {payload!r}")
+
+
 class Perception:
     """Owns the sensor registry and observation log; publishes ObservationCreated events."""
 
@@ -91,6 +166,9 @@ class Perception:
         self._kernel = kernel
         self.sensor_registry = SensorRegistry()
         self.observation_log = ObservationLog()
+        self.adapter_registry = AdapterRegistry()
+        self.adapter_registry.register(FlatValueAdapter())
+        self.adapter_registry.register(NestedReadingAdapter())
 
     def record_observation(
         self,
@@ -128,9 +206,31 @@ class Perception:
         )
         return observation
 
+    def record_raw_observation(self, *, sensor_id: str, payload: object) -> Observation:
+        """Normalize a raw sensor payload through the adapter registry, then record it.
+
+        Raises ValueError if the sensor is not registered/active or no adapter accepts the payload.
+        """
+        if not self.sensor_registry.is_active(sensor_id):
+            raise ValueError(f"sensor '{sensor_id}' is not registered or not active")
+
+        raw_source_type = self.sensor_registry.get_metadata(sensor_id).source_type
+        reading = self.adapter_registry.normalize(payload)
+        return self.record_observation(
+            sensor_id=sensor_id,
+            normalized_value=reading.normalized_value,
+            confidence=reading.confidence,
+            raw_source_type=raw_source_type,
+        )
+
 
 __all__ = [
+    "AdapterRegistry",
+    "FlatValueAdapter",
+    "NestedReadingAdapter",
+    "NormalizedReading",
     "Observation",
+    "ObservationAdapter",
     "ObservationLog",
     "Perception",
     "SensorMetadata",
