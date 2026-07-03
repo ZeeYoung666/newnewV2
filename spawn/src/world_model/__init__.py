@@ -60,6 +60,13 @@ class WorldModel:
         self._kernel = kernel
         self.belief_store = BeliefStore()
         kernel.register_subscriber(EventType.OBSERVATION_CREATED, self._on_observation_created)
+        kernel.register_snapshot_source(
+            "world_model.beliefs", Belief, self.belief_store.read_all, self._restore_beliefs
+        )
+
+    def _restore_beliefs(self, beliefs: list[Belief]) -> None:
+        for belief in beliefs:
+            self.belief_store.put(belief)
 
     def _belief_id_for_sensor(self, sensor_id: str) -> str:
         return f"sensor:{sensor_id}"

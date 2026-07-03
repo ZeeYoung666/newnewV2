@@ -137,6 +137,30 @@ class MemoryLedger:
         self.heuristic_store = HeuristicStore()
         kernel.register_subscriber(EventType.ACTION_SUCCEEDED, self._on_action_succeeded)
         kernel.register_subscriber(EventType.ACTION_FAILED, self._on_action_failed)
+        kernel.register_snapshot_source(
+            "memory.outcomes", Outcome, self.outcome_store.read_all, self._restore_outcomes
+        )
+        kernel.register_snapshot_source(
+            "memory.episodic_entries",
+            EpisodicMemoryEntry,
+            self.episodic_memory_store.read_all,
+            self._restore_episodic_entries,
+        )
+        kernel.register_snapshot_source(
+            "memory.ledger_entries", LedgerEntry, self.financial_ledger.read_all, self._restore_ledger_entries
+        )
+
+    def _restore_outcomes(self, outcomes: list[Outcome]) -> None:
+        for outcome in outcomes:
+            self.outcome_store.append(outcome)
+
+    def _restore_episodic_entries(self, entries: list[EpisodicMemoryEntry]) -> None:
+        for entry in entries:
+            self.episodic_memory_store.append(entry)
+
+    def _restore_ledger_entries(self, entries: list[LedgerEntry]) -> None:
+        for entry in entries:
+            self.financial_ledger.append(entry)
 
     def _on_action_succeeded(self, event: ActionSucceededEvent) -> None:
         self._record(

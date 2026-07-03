@@ -90,6 +90,13 @@ class Executor:
         self.tool_registry = ToolRegistry()
         self.action_log = ActionLog()
         kernel.register_subscriber(EventType.APPROVAL_GRANTED, self._on_approval_granted)
+        kernel.register_snapshot_source(
+            "executor.actions", ActionRecord, self.action_log.read_all, self._restore_actions
+        )
+
+    def _restore_actions(self, records: list[ActionRecord]) -> None:
+        for record in records:
+            self.action_log.append(record)
 
     def _on_approval_granted(self, event: ApprovalGrantedEvent) -> None:
         for ordered_action in event.ordered_actions:

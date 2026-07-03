@@ -130,6 +130,20 @@ class Governor:
         self._active_constitution_id: Optional[str] = None
         self._active_budget_id: Optional[str] = None
         kernel.register_subscriber(EventType.PLAN_PROPOSED, self._on_plan_proposed)
+        kernel.register_snapshot_source(
+            "governor.budgets", BudgetState, self.budget_store.read_all, self._restore_budgets
+        )
+        kernel.register_snapshot_source(
+            "governor.approvals", ApprovalRecord, self.approval_log.read_all, self._restore_approvals
+        )
+
+    def _restore_budgets(self, budgets: list[BudgetState]) -> None:
+        for budget in budgets:
+            self.budget_store.put(budget)
+
+    def _restore_approvals(self, records: list[ApprovalRecord]) -> None:
+        for record in records:
+            self.approval_log.append(record)
 
     def adopt_constitution(self, constitution: Constitution) -> None:
         """Adopt a constitution as the currently active one."""

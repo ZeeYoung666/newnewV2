@@ -155,6 +155,28 @@ class Executive:
         self.decision_record_store = DecisionRecordStore()
         kernel.register_subscriber(EventType.BELIEF_CREATED, self._on_belief_created)
         kernel.register_subscriber(EventType.BELIEF_UPDATED, self._on_belief_updated)
+        kernel.register_snapshot_source(
+            "executive.opportunities", Opportunity, self.opportunity_store.read_all, self._restore_opportunities
+        )
+        kernel.register_snapshot_source("executive.plans", Plan, self.plan_store.read_all, self._restore_plans)
+        kernel.register_snapshot_source(
+            "executive.decision_records",
+            DecisionRecord,
+            self.decision_record_store.read_all,
+            self._restore_decision_records,
+        )
+
+    def _restore_opportunities(self, opportunities: list[Opportunity]) -> None:
+        for opportunity in opportunities:
+            self.opportunity_store.append(opportunity)
+
+    def _restore_plans(self, plans: list[Plan]) -> None:
+        for plan in plans:
+            self.plan_store.append(plan)
+
+    def _restore_decision_records(self, records: list[DecisionRecord]) -> None:
+        for record in records:
+            self.decision_record_store.append(record)
 
     def _on_belief_created(self, event: BeliefCreatedEvent) -> None:
         self._process_belief(belief_id=event.belief_id, confidence=event.confidence)
