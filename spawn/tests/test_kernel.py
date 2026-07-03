@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
 
 from src.events import (
@@ -13,7 +14,7 @@ from src.events import (
     KernelStoppedEvent,
     ObservationCreatedEvent,
 )
-from src.kernel import EventLog, Kernel, Scheduler, Subscriber
+from src.kernel import EventLog, Kernel, Scheduler, SnapshotStore, Subscriber
 
 
 class KernelTests(unittest.TestCase):
@@ -410,6 +411,140 @@ class EventLogPersistenceTests(unittest.TestCase):
         snapshot.append((99, Event(source_component="rogue", event_type=EventType.BELIEF_UPDATED)))
 
         self.assertEqual(len(restarted.read_all()), 1)
+
+
+class EventLogPathTests(unittest.TestCase):
+    def test_path_property_exposes_backing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "events.jsonl"
+            log = EventLog(path=log_path)
+
+            self.assertEqual(log.path, log_path)
+
+
+class SnapshotStoreTests(unittest.TestCase):
+    def test_load_returns_none_when_no_snapshot_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SnapshotStore(path=Path(tmpdir) / "events.snapshot.json")
+
+            self.assertIsNone(store.load())
+
+    def test_save_then_load_round_trips_the_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SnapshotStore(path=Path(tmpdir) / "events.snapshot.json")
+
+            store.save(7, {"world_model.beliefs": [{"belief_id": "sensor:x", "confidence": 0.5}]})
+            record = store.load()
+
+            self.assertEqual(record["sequence"], 7)
+            self.assertEqual(record["sources"]["world_model.beliefs"][0]["belief_id"], "sensor:x")
+
+    def test_save_overwrites_the_previous_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SnapshotStore(path=Path(tmpdir) / "events.snapshot.json")
+
+            store.save(1, {"a": []})
+            store.save(2, {"b": []})
+            record = store.load()
+
+            self.assertEqual(record["sequence"], 2)
+            self.assertEqual(record["sources"], {"b": []})
+
+    def test_default_path_is_isolated_per_instance(self) -> None:
+        first = SnapshotStore()
+        second = SnapshotStore()
+
+        first.save(1, {"a": []})
+
+        self.assertIsNone(second.load())
+
+
+@dataclass(slots=True, kw_only=True, frozen=True)
+class _StubRecord:
+    record_id: str
+    value: float
+
+
+class KernelSnapshotTests(unittest.TestCase):
+    def test_kernel_derives_a_snapshot_path_from_the_event_log_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "events.jsonl"
+            kernel = Kernel(event_log=EventLog(path=log_path))
+
+            self.assertEqual(kernel.snapshot_store._path, Path(tmpdir) / "events.snapshot.json")
+
+    def test_create_snapshot_returns_the_event_log_sequence(self) -> None:
+        kernel = Kernel()
+        kernel.publish(Event(source_component="test", event_type=EventType.BELIEF_UPDATED))
+        kernel.publish(Event(source_component="test", event_type=EventType.BELIEF_UPDATED))
+
+        sequence = kernel.create_snapshot()
+
+        self.assertEqual(sequence, 2)
+
+    def test_create_snapshot_persists_every_registered_source(self) -> None:
+        kernel = Kernel()
+        store: list[_StubRecord] = [_StubRecord(record_id="a", value=1.0)]
+        kernel.register_snapshot_source("stub", _StubRecord, lambda: store, store.extend)
+
+        kernel.create_snapshot()
+        record = kernel.snapshot_store.load()
+
+        self.assertEqual(record["sources"]["stub"], [{"record_id": "a", "value": 1.0}])
+
+    def test_create_snapshot_with_no_sources_registered_persists_an_empty_record(self) -> None:
+        kernel = Kernel()
+
+        sequence = kernel.create_snapshot()
+        record = kernel.snapshot_store.load()
+
+        self.assertEqual(sequence, 0)
+        self.assertEqual(record["sources"], {})
+
+
+class KernelSnapshotReplayTests(unittest.TestCase):
+    def test_replay_with_no_snapshot_dispatches_every_event(self) -> None:
+        kernel = Kernel()
+        received: list[Event] = []
+        kernel.register_subscriber(EventType.BELIEF_UPDATED, received.append)
+        kernel.publish(Event(source_component="test", event_type=EventType.BELIEF_UPDATED))
+        kernel.publish(Event(source_component="test", event_type=EventType.BELIEF_UPDATED))
+
+        rebuilt = Kernel(event_log=kernel.event_log)
+        rebuilt.register_subscriber(EventType.BELIEF_UPDATED, received.append)
+        rebuilt.replay()
+
+        self.assertEqual(len(received), 4)  # 2 from the live kernel, 2 from replay
+
+    def test_replay_restores_snapshot_state_via_registered_source(self) -> None:
+        kernel = Kernel()
+        store: list[_StubRecord] = []
+        kernel.register_snapshot_source("stub", _StubRecord, lambda: store, store.extend)
+        store.append(_StubRecord(record_id="a", value=1.0))
+        kernel.create_snapshot()
+
+        rebuilt = Kernel(event_log=kernel.event_log, snapshot_store=kernel.snapshot_store)
+        restored: list[_StubRecord] = []
+        rebuilt.register_snapshot_source("stub", _StubRecord, lambda: restored, restored.extend)
+        rebuilt.replay()
+
+        self.assertEqual(restored, [_StubRecord(record_id="a", value=1.0)])
+
+    def test_replay_only_dispatches_events_after_the_snapshot_sequence(self) -> None:
+        kernel = Kernel()
+        dispatched: list[Event] = []
+        kernel.register_subscriber(EventType.BELIEF_UPDATED, dispatched.append)
+        kernel.publish(Event(source_component="test", event_type=EventType.BELIEF_UPDATED))
+        kernel.publish(Event(source_component="test", event_type=EventType.BELIEF_UPDATED))
+        kernel.create_snapshot()
+        kernel.publish(Event(source_component="test", event_type=EventType.BELIEF_UPDATED))
+
+        rebuilt = Kernel(event_log=kernel.event_log, snapshot_store=kernel.snapshot_store)
+        replayed: list[Event] = []
+        rebuilt.register_subscriber(EventType.BELIEF_UPDATED, replayed.append)
+        rebuilt.replay()
+
+        self.assertEqual(len(replayed), 1)  # only the post-snapshot event
 
 
 if __name__ == "__main__":

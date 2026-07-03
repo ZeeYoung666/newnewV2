@@ -24,6 +24,8 @@ from src.events import (
 )
 
 Subscriber = Callable[[Event], None]
+SnapshotCapture = Callable[[], list]
+SnapshotRestore = Callable[[list], None]
 
 _EVENT_CLASSES: dict[str, type[Event]] = {
     name: obj
@@ -62,16 +64,29 @@ def _decode_value(value: object, target_type: object) -> object:
     return value
 
 
+def _encode_dataclass_fields(obj: object) -> dict:
+    """Encode every field of an arbitrary dataclass instance to a JSON-safe dict.
+
+    Shared by event log persistence and snapshot persistence — both need the
+    same UUID/datetime/tuple-aware field encoding, just wrapped differently.
+    """
+    return {f.name: _encode_value(getattr(obj, f.name)) for f in dataclasses.fields(obj)}
+
+
+def _decode_dataclass(fields: dict, cls: type) -> object:
+    """Decode a JSON-safe field dict back into an instance of the given dataclass."""
+    type_hints = typing.get_type_hints(cls)
+    kwargs = {name: _decode_value(value, type_hints[name]) for name, value in fields.items()}
+    return cls(**kwargs)
+
+
 def _encode_event(sequence_number: int, event: Event) -> dict:
-    fields = {f.name: _encode_value(getattr(event, f.name)) for f in dataclasses.fields(event)}
-    return {"sequence": sequence_number, "class": type(event).__name__, "fields": fields}
+    return {"sequence": sequence_number, "class": type(event).__name__, "fields": _encode_dataclass_fields(event)}
 
 
 def _decode_event(record: dict) -> tuple[int, Event]:
     cls = _EVENT_CLASSES[record["class"]]
-    type_hints = typing.get_type_hints(cls)
-    kwargs = {name: _decode_value(value, type_hints[name]) for name, value in record["fields"].items()}
-    return record["sequence"], cls(**kwargs)
+    return record["sequence"], _decode_dataclass(record["fields"], cls)
 
 
 class EventLog:
@@ -93,6 +108,11 @@ class EventLog:
         self._entries: list[tuple[int, Event]] = []
         self._next_sequence = 1
         self._load_existing()
+
+    @property
+    def path(self) -> Path:
+        """The on-disk location backing this log."""
+        return self._path
 
     def _load_existing(self) -> None:
         if not self._path.exists():
@@ -133,6 +153,50 @@ class EventLog:
         if not self._entries:
             return 0
         return self._entries[-1][0]
+
+
+class SnapshotStore:
+    """Disk-backed store for the single most recent organism snapshot.
+
+    Every create_snapshot() call atomically overwrites this file — only the
+    latest snapshot is ever retained, there is no history of snapshots. The
+    EventLog itself is never touched by this class and stays append-only
+    regardless of how many snapshots are taken.
+    """
+
+    def __init__(self, path: Union[str, "os.PathLike[str]", None] = None) -> None:
+        if path is None:
+            fd, generated_path = tempfile.mkstemp(suffix=".snapshot.json", prefix="snapshot-")
+            os.close(fd)
+            path = generated_path
+        self._path = Path(path)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+
+    def save(self, sequence: int, sources: dict) -> None:
+        """Atomically persist a snapshot, replacing whatever was there before."""
+        record = {"sequence": sequence, "sources": sources}
+        tmp_path = self._path.with_name(self._path.name + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as fh:
+            json.dump(record, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, self._path)
+
+    def load(self) -> Optional[dict]:
+        """Return the persisted snapshot record, or None if none exists yet.
+
+        The default (path=None) constructor path uses tempfile.mkstemp,
+        which creates an empty file on disk before any snapshot is ever
+        saved — an empty file is treated the same as a missing one rather
+        than a JSON decode error.
+        """
+        if not self._path.exists():
+            return None
+        with self._path.open("r", encoding="utf-8") as fh:
+            content = fh.read()
+        if not content:
+            return None
+        return json.loads(content)
 
 
 class Scheduler:
@@ -199,9 +263,17 @@ class Kernel:
         EventType.KERNEL_STOPPED,
     }
 
-    def __init__(self, event_log: Optional[EventLog] = None) -> None:
+    def __init__(
+        self, event_log: Optional[EventLog] = None, snapshot_store: Optional[SnapshotStore] = None
+    ) -> None:
         self._subscribers: DefaultDict[EventType, list[Subscriber]] = defaultdict(list)
         self.event_log = event_log if event_log is not None else EventLog()
+        self.snapshot_store = (
+            snapshot_store
+            if snapshot_store is not None
+            else SnapshotStore(path=self.event_log.path.with_suffix(".snapshot.json"))
+        )
+        self._snapshot_sources: dict[str, tuple[type, SnapshotCapture, SnapshotRestore]] = {}
         self.scheduler = Scheduler()
         self._pending_terminal_lifecycle = 0
         self._running = False
@@ -230,6 +302,31 @@ class Kernel:
         """Alias for unregister_subscriber."""
         self.unregister_subscriber(event_type, subscriber)
 
+    def register_snapshot_source(
+        self, name: str, item_cls: type, capture: SnapshotCapture, restore: SnapshotRestore
+    ) -> None:
+        """Register a component's own store for snapshot capture/restore.
+
+        `capture` and `restore` close over exactly one component's own store
+        (e.g. `self.belief_store.read_all` / a helper that calls
+        `self.belief_store.put` for each item) — the Kernel only ever sees an
+        opaque list of `item_cls` instances, never reaches into store
+        internals itself, and never crosses into another component's store.
+        """
+        self._snapshot_sources[name] = (item_cls, capture, restore)
+
+    def create_snapshot(self) -> int:
+        """Capture every registered source's current state at the event log's
+        current sequence number and persist it as the new latest snapshot.
+        """
+        sequence = self.event_log.latest_sequence()
+        sources = {
+            name: [_encode_dataclass_fields(item) for item in capture()]
+            for name, (_, capture, _) in self._snapshot_sources.items()
+        }
+        self.snapshot_store.save(sequence, sources)
+        return sequence
+
     def start(self) -> None:
         """Start the kernel event loop, replaying any persisted history first."""
         if not self._running:
@@ -255,16 +352,17 @@ class Kernel:
         return self._running
 
     def replay(self) -> int:
-        """Reconstruct component state by re-dispatching every already-persisted
-        event through the normal typed-event handlers, in original sequence
-        order. Must run before the kernel starts, and runs at most once.
+        """Reconstruct component state from the latest snapshot (if any) plus
+        every event recorded after it, in original sequence order. Must run
+        before the kernel starts, and runs at most once.
 
-        Events a handler re-publishes while this runs are not re-appended to
-        the log or re-dispatched here: each one is already its own entry in
-        the log and gets visited directly by this same loop when its own
-        sequence number is reached. Suppressing the nested publish is what
-        keeps every historical event dispatched exactly once and leaves the
-        log with no duplicates.
+        With no snapshot present this dispatches from sequence 1, identical
+        to full replay. Events a handler re-publishes while this runs are not
+        re-appended to the log or re-dispatched here: each one is already its
+        own entry in the log and gets visited directly by this same loop when
+        its own sequence number is reached. Suppressing the nested publish is
+        what keeps every historical event dispatched exactly once and leaves
+        the log with no duplicates.
         """
         if self._started:
             raise RuntimeError("cannot replay after the kernel has started")
@@ -273,12 +371,29 @@ class Kernel:
 
         self._replaying = True
         try:
-            for _, event in self.event_log.read_all():
+            snapshot_sequence = self._restore_latest_snapshot()
+            start_sequence = 1 if snapshot_sequence is None else snapshot_sequence + 1
+            for _, event in self.event_log.read_from(start_sequence):
                 self.dispatch(event)
         finally:
             self._replaying = False
         self._replayed = True
         return self.event_log.latest_sequence()
+
+    def _restore_latest_snapshot(self) -> Optional[int]:
+        """Load the latest snapshot (if any) and hand each source's state back
+        to the component that registered it. Returns the snapshot's sequence
+        number, or None if no snapshot has ever been taken.
+        """
+        record = self.snapshot_store.load()
+        if record is None:
+            return None
+        for name, encoded_items in record["sources"].items():
+            if name not in self._snapshot_sources:
+                continue
+            item_cls, _, restore = self._snapshot_sources[name]
+            restore([_decode_dataclass(fields, item_cls) for fields in encoded_items])
+        return record["sequence"]
 
     def publish(self, event: Event) -> None:
         """Queue an event for processing by the event loop, via the scheduler.
@@ -339,4 +454,4 @@ class Kernel:
             subscriber(event)
 
 
-__all__ = ["EventLog", "Kernel", "Scheduler", "Subscriber"]
+__all__ = ["EventLog", "Kernel", "Scheduler", "SnapshotStore", "Subscriber"]
