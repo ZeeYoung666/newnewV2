@@ -19,6 +19,8 @@ from src.events import (
     ConstitutionAmendedEvent,
     ConstitutionAmendmentProposedEvent,
     ConstitutionAmendmentRejectedEvent,
+    EscalationCreatedEvent,
+    EscalationResolvedEvent,
     EventType,
     PlanProposedEvent,
     PolicyEvaluatedEvent,
@@ -153,6 +155,27 @@ class Amendment:
     reason: Optional[str] = None
 
 
+@dataclass(slots=True, kw_only=True, frozen=True)
+class EscalationRecord:
+    """An immutable audit trail entry for one escalation lifecycle transition.
+
+    One record is appended per transition (pending, then resolved) — never
+    mutated — mirroring AmendmentLog's shape, so the full history survives
+    in EscalationStore even though `status` only ever describes that single
+    transition.
+    """
+
+    escalation_id: str
+    plan_id: str
+    reason: str
+    ordered_actions: tuple[str, ...]
+    status: str
+    created_at: datetime
+    decision: Optional[str] = None
+    resolved_at: Optional[datetime] = None
+    resolved_by: Optional[str] = None
+
+
 class ConstitutionStore:
     """Append-only store of constitutions, keyed by constitution_id."""
 
@@ -236,6 +259,28 @@ class AmendmentLog:
         return [record for record in self._records if record.amendment_id == amendment_id]
 
 
+class EscalationStore:
+    """Append-only log of escalation lifecycle transitions.
+
+    Like AmendmentLog, an escalation_id can appear more than once (pending,
+    then resolved) — read_all() returns every transition ever recorded, in
+    order, so the full audit trail is always available.
+    """
+
+    def __init__(self) -> None:
+        self._records: list[EscalationRecord] = []
+
+    def append(self, record: EscalationRecord) -> None:
+        self._records.append(record)
+
+    def read_all(self) -> list[EscalationRecord]:
+        return list(self._records)
+
+    def history_for(self, escalation_id: str) -> list[EscalationRecord]:
+        """All transitions recorded for a single escalation, in order."""
+        return [record for record in self._records if record.escalation_id == escalation_id]
+
+
 class Governor:
     """Evaluates proposed plans against the constitution and budget, and authorizes or rejects them."""
 
@@ -246,12 +291,16 @@ class Governor:
         self.budget_store = BudgetStore()
         self.approval_log = ApprovalLog()
         self.amendment_log = AmendmentLog()
+        self.escalation_store = EscalationStore()
         self._active_budget_id: Optional[str] = None
         self._pending_amendments: dict[str, Constitution] = {}
+        self._pending_escalations: dict[str, EscalationRecord] = {}
         kernel.register_subscriber(EventType.PLAN_PROPOSED, self._on_plan_proposed)
         kernel.register_subscriber(EventType.CONSTITUTION_AMENDMENT_PROPOSED, self._on_amendment_proposed)
         kernel.register_subscriber(EventType.CONSTITUTION_AMENDED, self._on_amendment_approved)
         kernel.register_subscriber(EventType.CONSTITUTION_AMENDMENT_REJECTED, self._on_amendment_rejected)
+        kernel.register_subscriber(EventType.ESCALATION_CREATED, self._on_escalation_created)
+        kernel.register_subscriber(EventType.ESCALATION_RESOLVED, self._on_escalation_resolved)
         kernel.register_snapshot_source(
             "governor.budgets", BudgetState, self.budget_store.read_all, self._restore_budgets
         )
@@ -263,6 +312,9 @@ class Governor:
         )
         kernel.register_snapshot_source(
             "governor.amendments", Amendment, self.amendment_log.read_all, self._restore_amendments
+        )
+        kernel.register_snapshot_source(
+            "governor.escalations", EscalationRecord, self.escalation_store.read_all, self._restore_escalations
         )
 
     def _restore_budgets(self, budgets: list[BudgetState]) -> None:
@@ -292,6 +344,18 @@ class Governor:
             )
             for amendment_id, record in latest_by_id.items()
             if record.status == "proposed"
+        }
+
+    def _restore_escalations(self, records: list[EscalationRecord]) -> None:
+        for record in records:
+            self.escalation_store.append(record)
+        latest_by_id: dict[str, EscalationRecord] = {}
+        for record in records:
+            latest_by_id[record.escalation_id] = record
+        self._pending_escalations = {
+            escalation_id: record
+            for escalation_id, record in latest_by_id.items()
+            if record.status == "pending"
         }
 
     def adopt_constitution(self, constitution: Constitution) -> None:
@@ -365,6 +429,40 @@ class Governor:
             )
         )
 
+    def approve_escalation(self, escalation_id: str, *, approved_by: str = "owner") -> None:
+        """Approve a pending escalation, resuming the normal approval pipeline for its plan.
+
+        Raises KeyError if the escalation is unknown or already resolved.
+        """
+        pending = self._pending_escalations[escalation_id]
+        self._kernel.publish(
+            EscalationResolvedEvent(
+                source_component="governor",
+                escalation_id=escalation_id,
+                plan_id=pending.plan_id,
+                decision="approved",
+                resolved_by=approved_by,
+                reason="owner approved escalation",
+            )
+        )
+
+    def deny_escalation(self, escalation_id: str, *, reason: str, denied_by: str = "owner") -> None:
+        """Deny a pending escalation, permanently rejecting its plan.
+
+        Raises KeyError if the escalation is unknown or already resolved.
+        """
+        pending = self._pending_escalations[escalation_id]
+        self._kernel.publish(
+            EscalationResolvedEvent(
+                source_component="governor",
+                escalation_id=escalation_id,
+                plan_id=pending.plan_id,
+                decision="denied",
+                resolved_by=denied_by,
+                reason=reason,
+            )
+        )
+
     def _on_amendment_proposed(self, event: ConstitutionAmendmentProposedEvent) -> None:
         constitution = Constitution(
             constitution_id=event.constitution_id,
@@ -427,10 +525,10 @@ class Governor:
         try:
             constitution = self.constitution_store.current()
         except LookupError:
-            self._require_approval(event.plan_id, "no constitution configured")
+            self._require_approval(event, "no constitution configured")
             return
         if self._active_budget_id is None:
-            self._require_approval(event.plan_id, "no budget configured")
+            self._require_approval(event, "no budget configured")
             return
 
         policy_passed, policy_reason = self._rule_registry.evaluate(constitution, event)
@@ -504,8 +602,74 @@ class Governor:
             ApprovalDeniedEvent(source_component="governor", approval_id=approval_id, plan_id=plan_id, reason=reason)
         )
 
-    def _require_approval(self, plan_id: str, reason: str) -> None:
-        self._kernel.publish(ApprovalRequiredEvent(source_component="governor", plan_id=plan_id, reason=reason))
+    def _require_approval(self, event: PlanProposedEvent, reason: str) -> None:
+        """Escalate a plan the Governor cannot decide on automatically.
+
+        Publishes the pre-existing dead-end signal (ApprovalRequiredEvent,
+        unchanged for backward compatibility) alongside EscalationCreatedEvent,
+        which is what this Governor's own subscriber actually turns into a
+        durable, resumable escalation.
+        """
+        self._kernel.publish(
+            ApprovalRequiredEvent(source_component="governor", plan_id=event.plan_id, reason=reason)
+        )
+        self._kernel.publish(
+            EscalationCreatedEvent(
+                source_component="governor",
+                escalation_id=str(uuid4()),
+                plan_id=event.plan_id,
+                reason=reason,
+                ordered_actions=event.ordered_actions,
+            )
+        )
+
+    def _on_escalation_created(self, event: EscalationCreatedEvent) -> None:
+        record = EscalationRecord(
+            escalation_id=event.escalation_id,
+            plan_id=event.plan_id,
+            reason=event.reason,
+            ordered_actions=event.ordered_actions,
+            status="pending",
+            created_at=event.timestamp,
+        )
+        self.escalation_store.append(record)
+        self._pending_escalations[event.escalation_id] = record
+
+    def _on_escalation_resolved(self, event: EscalationResolvedEvent) -> None:
+        pending = self._pending_escalations.pop(event.escalation_id)
+        self.escalation_store.append(
+            EscalationRecord(
+                escalation_id=event.escalation_id,
+                plan_id=pending.plan_id,
+                reason=pending.reason,
+                ordered_actions=pending.ordered_actions,
+                status="resolved",
+                created_at=pending.created_at,
+                decision=event.decision,
+                resolved_at=event.timestamp,
+                resolved_by=event.resolved_by,
+            )
+        )
+        if event.decision == "approved":
+            self._grant_via_escalation(pending.plan_id, pending.ordered_actions)
+        else:
+            self._deny(pending.plan_id, event.reason)
+
+    def _grant_via_escalation(self, plan_id: str, ordered_actions: tuple[str, ...]) -> None:
+        approval_id = str(uuid4())
+        reason = "owner-approved escalation"
+        self.approval_log.append(
+            ApprovalRecord(approval_id=approval_id, plan_id=plan_id, decision="approved", reason=reason)
+        )
+        self._kernel.publish(
+            ApprovalGrantedEvent(
+                source_component="governor",
+                approval_id=approval_id,
+                plan_id=plan_id,
+                reason=reason,
+                ordered_actions=ordered_actions,
+            )
+        )
 
 
 __all__ = [
@@ -513,10 +677,12 @@ __all__ = [
     "BudgetState",
     "ApprovalRecord",
     "Amendment",
+    "EscalationRecord",
     "ConstitutionStore",
     "BudgetStore",
     "ApprovalLog",
     "AmendmentLog",
+    "EscalationStore",
     "RuleRegistry",
     "RuleEvaluator",
     "DEFAULT_RULES",

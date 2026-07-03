@@ -10,6 +10,8 @@ from src.events import (
     ConstitutionAmendedEvent,
     ConstitutionAmendmentProposedEvent,
     ConstitutionAmendmentRejectedEvent,
+    EscalationCreatedEvent,
+    EscalationResolvedEvent,
     Event,
     EventType,
     PlanProposedEvent,
@@ -24,6 +26,8 @@ from src.governor import (
     BudgetStore,
     Constitution,
     ConstitutionStore,
+    EscalationRecord,
+    EscalationStore,
     Governor,
     RuleRegistry,
 )
@@ -734,6 +738,274 @@ class GovernorReplayTests(unittest.TestCase):
             self.assertEqual(original.passed, replayed.passed)
             self.assertEqual(original.constitution_id, replayed.constitution_id)
             self.assertEqual(original.reason, replayed.reason)
+
+
+class EscalationRecordModelTests(unittest.TestCase):
+    def test_escalation_record_carries_required_fields(self) -> None:
+        now = datetime.now(timezone.utc)
+        record = EscalationRecord(
+            escalation_id="escalation-1",
+            plan_id="plan-1",
+            reason="no constitution configured",
+            ordered_actions=("investigate:opportunity-1",),
+            status="pending",
+            created_at=now,
+        )
+
+        self.assertEqual(record.escalation_id, "escalation-1")
+        self.assertEqual(record.plan_id, "plan-1")
+        self.assertEqual(record.reason, "no constitution configured")
+        self.assertEqual(record.ordered_actions, ("investigate:opportunity-1",))
+        self.assertEqual(record.status, "pending")
+        self.assertEqual(record.created_at, now)
+        self.assertIsNone(record.decision)
+        self.assertIsNone(record.resolved_at)
+        self.assertIsNone(record.resolved_by)
+
+    def test_escalation_record_is_immutable(self) -> None:
+        record = EscalationRecord(
+            escalation_id="escalation-1",
+            plan_id="plan-1",
+            reason="no budget configured",
+            ordered_actions=(),
+            status="pending",
+            created_at=datetime.now(timezone.utc),
+        )
+
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            record.status = "resolved"  # type: ignore[misc]
+
+
+class EscalationStoreTests(unittest.TestCase):
+    def test_append_read_all_and_history_for(self) -> None:
+        store = EscalationStore()
+        pending = EscalationRecord(
+            escalation_id="escalation-1",
+            plan_id="plan-1",
+            reason="no budget configured",
+            ordered_actions=(),
+            status="pending",
+            created_at=datetime.now(timezone.utc),
+        )
+        resolved = EscalationRecord(
+            escalation_id="escalation-1",
+            plan_id="plan-1",
+            reason="no budget configured",
+            ordered_actions=(),
+            status="resolved",
+            created_at=pending.created_at,
+            decision="approved",
+            resolved_at=datetime.now(timezone.utc),
+            resolved_by="owner",
+        )
+
+        store.append(pending)
+        store.append(resolved)
+
+        self.assertEqual(store.read_all(), [pending, resolved])
+        self.assertEqual(store.history_for("escalation-1"), [pending, resolved])
+        self.assertEqual(store.history_for("no-such-escalation"), [])
+
+
+class GovernorEscalationLifecycleTests(unittest.TestCase):
+    def test_plan_without_constitution_creates_exactly_one_escalation(self) -> None:
+        kernel = Kernel()
+        governor = Governor(kernel)
+        created: list[Event] = []
+        kernel.register_subscriber(EventType.ESCALATION_CREATED, created.append)
+
+        publish_plan_proposed(kernel, plan_id="plan-1")
+
+        self.assertEqual(len(created), 1)
+        self.assertIsInstance(created[0], EscalationCreatedEvent)
+        self.assertEqual(created[0].plan_id, "plan-1")
+        self.assertEqual(created[0].reason, "no constitution configured")
+
+        history = governor.escalation_store.read_all()
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0].status, "pending")
+        self.assertEqual(history[0].plan_id, "plan-1")
+
+    def test_plan_without_budget_creates_exactly_one_escalation(self) -> None:
+        kernel = Kernel()
+        governor = Governor(kernel)
+        governor.adopt_constitution(
+            Constitution(constitution_id="constitution-1", version=1, rules=("non_negative_costs",))
+        )
+        created: list[Event] = []
+        kernel.register_subscriber(EventType.ESCALATION_CREATED, created.append)
+
+        publish_plan_proposed(kernel, plan_id="plan-1")
+
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0].reason, "no budget configured")
+        self.assertEqual(len(governor.escalation_store.read_all()), 1)
+
+    def test_approving_escalation_resumes_normal_pipeline_and_grants_plan(self) -> None:
+        kernel = Kernel()
+        governor = Governor(kernel)
+        created: list[EscalationCreatedEvent] = []
+        granted: list[Event] = []
+        resolved: list[Event] = []
+        kernel.register_subscriber(EventType.ESCALATION_CREATED, created.append)
+        kernel.register_subscriber(EventType.APPROVAL_GRANTED, granted.append)
+        kernel.register_subscriber(EventType.ESCALATION_RESOLVED, resolved.append)
+
+        publish_plan_proposed(
+            kernel, plan_id="plan-1", ordered_actions=("investigate:opportunity-1", "act_on:opportunity-1")
+        )
+        escalation_id = created[0].escalation_id
+
+        governor.approve_escalation(escalation_id, approved_by="owner")
+
+        self.assertEqual(len(resolved), 1)
+        self.assertIsInstance(resolved[0], EscalationResolvedEvent)
+        self.assertEqual(resolved[0].decision, "approved")
+
+        self.assertEqual(len(granted), 1)
+        self.assertIsInstance(granted[0], ApprovalGrantedEvent)
+        self.assertEqual(granted[0].plan_id, "plan-1")
+        self.assertEqual(granted[0].ordered_actions, ("investigate:opportunity-1", "act_on:opportunity-1"))
+
+        records = governor.approval_log.read_all()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].decision, "approved")
+
+        history = governor.escalation_store.history_for(escalation_id)
+        self.assertEqual([record.status for record in history], ["pending", "resolved"])
+        self.assertEqual(history[-1].decision, "approved")
+        self.assertEqual(history[-1].resolved_by, "owner")
+        self.assertNotIn(escalation_id, governor._pending_escalations)
+
+    def test_denying_escalation_permanently_rejects_the_plan(self) -> None:
+        kernel = Kernel()
+        governor = Governor(kernel)
+        created: list[EscalationCreatedEvent] = []
+        denied: list[Event] = []
+        kernel.register_subscriber(EventType.ESCALATION_CREATED, created.append)
+        kernel.register_subscriber(EventType.APPROVAL_DENIED, denied.append)
+
+        publish_plan_proposed(kernel, plan_id="plan-1")
+        escalation_id = created[0].escalation_id
+
+        governor.deny_escalation(escalation_id, reason="owner does not trust this plan")
+
+        self.assertEqual(len(denied), 1)
+        self.assertIsInstance(denied[0], ApprovalDeniedEvent)
+        self.assertEqual(denied[0].plan_id, "plan-1")
+        self.assertEqual(denied[0].reason, "owner does not trust this plan")
+
+        records = governor.approval_log.read_all()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].decision, "rejected")
+
+        history = governor.escalation_store.history_for(escalation_id)
+        self.assertEqual([record.status for record in history], ["pending", "resolved"])
+        self.assertEqual(history[-1].decision, "denied")
+
+        # Denial is final: the escalation can't be resolved a second time.
+        with self.assertRaises(KeyError):
+            governor.approve_escalation(escalation_id)
+
+    def test_approving_unknown_escalation_raises_keyerror(self) -> None:
+        kernel = Kernel()
+        governor = Governor(kernel)
+
+        with self.assertRaises(KeyError):
+            governor.approve_escalation("no-such-escalation")
+
+    def test_denying_unknown_escalation_raises_keyerror(self) -> None:
+        kernel = Kernel()
+        governor = Governor(kernel)
+
+        with self.assertRaises(KeyError):
+            governor.deny_escalation("no-such-escalation", reason="n/a")
+
+
+class GovernorEscalationReplayTests(unittest.TestCase):
+    def test_replay_reconstructs_pending_and_resolved_escalations(self) -> None:
+        event_log = EventLog()
+        kernel = Kernel(event_log=event_log)
+        governor = Governor(kernel)
+        governor.adopt_constitution(
+            Constitution(constitution_id="constitution-1", version=1, rules=("non_negative_costs",))
+        )
+
+        created: list[EscalationCreatedEvent] = []
+        kernel.register_subscriber(EventType.ESCALATION_CREATED, created.append)
+
+        # No budget configured yet: both plans escalate.
+        publish_plan_proposed(kernel, plan_id="plan-1")
+        publish_plan_proposed(kernel, plan_id="plan-2")
+        approved_id = created[0].escalation_id
+        denied_id = created[1].escalation_id
+
+        governor.approve_escalation(approved_id, approved_by="owner")
+        governor.deny_escalation(denied_id, reason="not worth the risk")
+
+        rebuilt_kernel = Kernel(event_log=event_log)
+        rebuilt_governor = Governor(rebuilt_kernel)
+        rebuilt_governor.adopt_constitution(
+            Constitution(constitution_id="constitution-1", version=1, rules=("non_negative_costs",))
+        )
+        rebuilt_kernel.replay()
+
+        self.assertEqual(
+            rebuilt_governor.escalation_store.read_all(), governor.escalation_store.read_all()
+        )
+        self.assertEqual(rebuilt_governor._pending_escalations, {})
+
+        approved_history = rebuilt_governor.escalation_store.history_for(approved_id)
+        self.assertEqual([record.status for record in approved_history], ["pending", "resolved"])
+        self.assertEqual(approved_history[-1].decision, "approved")
+
+        denied_history = rebuilt_governor.escalation_store.history_for(denied_id)
+        self.assertEqual([record.status for record in denied_history], ["pending", "resolved"])
+        self.assertEqual(denied_history[-1].decision, "denied")
+
+    def test_replay_leaves_still_pending_escalation_in_pending_dict(self) -> None:
+        event_log = EventLog()
+        kernel = Kernel(event_log=event_log)
+        governor = Governor(kernel)
+
+        created: list[EscalationCreatedEvent] = []
+        kernel.register_subscriber(EventType.ESCALATION_CREATED, created.append)
+        publish_plan_proposed(kernel, plan_id="plan-1")
+        pending_id = created[0].escalation_id
+
+        rebuilt_kernel = Kernel(event_log=event_log)
+        rebuilt_governor = Governor(rebuilt_kernel)
+        rebuilt_kernel.replay()
+
+        self.assertIn(pending_id, rebuilt_governor._pending_escalations)
+        self.assertEqual(rebuilt_governor._pending_escalations[pending_id].status, "pending")
+
+
+class GovernorEscalationSnapshotTests(unittest.TestCase):
+    def test_snapshot_restore_reconstructs_escalation_state(self) -> None:
+        kernel = Kernel()
+        governor = Governor(kernel)
+
+        created: list[EscalationCreatedEvent] = []
+        kernel.register_subscriber(EventType.ESCALATION_CREATED, created.append)
+        publish_plan_proposed(kernel, plan_id="plan-1")
+        publish_plan_proposed(kernel, plan_id="plan-2")
+        resolved_id = created[0].escalation_id
+        still_pending_id = created[1].escalation_id
+
+        governor.approve_escalation(resolved_id, approved_by="owner")
+        kernel.create_snapshot()
+
+        rebuilt_kernel = Kernel(event_log=kernel.event_log, snapshot_store=kernel.snapshot_store)
+        rebuilt_governor = Governor(rebuilt_kernel)
+        rebuilt_kernel.replay()
+
+        restored = {record.escalation_id: record for record in rebuilt_governor.escalation_store.read_all()}
+        self.assertEqual(restored[resolved_id].status, "resolved")
+        self.assertEqual(restored[resolved_id].decision, "approved")
+        self.assertEqual(restored[still_pending_id].status, "pending")
+        self.assertIn(still_pending_id, rebuilt_governor._pending_escalations)
+        self.assertNotIn(resolved_id, rebuilt_governor._pending_escalations)
 
 
 if __name__ == "__main__":

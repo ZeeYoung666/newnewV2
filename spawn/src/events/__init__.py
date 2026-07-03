@@ -27,8 +27,15 @@ class EventType(str, Enum):
     CONSTITUTION_AMENDMENT_PROPOSED = "constitution.amendment_proposed"
     CONSTITUTION_AMENDED = "constitution.amended"
     CONSTITUTION_AMENDMENT_REJECTED = "constitution.amendment_rejected"
+    ESCALATION_CREATED = "escalation.created"
+    ESCALATION_RESOLVED = "escalation.resolved"
     ACTION_APPROVED = "action.approved"
     ACTION_ATTEMPTED = "action.attempted"
+    SANDBOX_EXECUTION_STARTED = "sandbox.execution_started"
+    SANDBOX_EXECUTION_COMPLETED = "sandbox.execution_completed"
+    ACTION_RETRY_SCHEDULED = "action.retry_scheduled"
+    ACTION_RETRY_STARTED = "action.retry_started"
+    ACTION_RETRY_EXHAUSTED = "action.retry_exhausted"
     ACTION_SUCCEEDED = "action.succeeded"
     ACTION_FAILED = "action.failed"
     OUTCOME_RECORDED = "outcome.recorded"
@@ -219,6 +226,29 @@ class ConstitutionAmendmentRejectedEvent(Event):
 
 
 @dataclass(slots=True, kw_only=True)
+class EscalationCreatedEvent(Event):
+    """Represents a plan escalated to the owner for a decision the Governor could not make automatically."""
+
+    escalation_id: str
+    plan_id: str
+    reason: str
+    ordered_actions: tuple[str, ...]
+    event_type: EventType = EventType.ESCALATION_CREATED
+
+
+@dataclass(slots=True, kw_only=True)
+class EscalationResolvedEvent(Event):
+    """Represents an owner decision resolving a pending escalation."""
+
+    escalation_id: str
+    plan_id: str
+    decision: str
+    resolved_by: str
+    reason: str
+    event_type: EventType = EventType.ESCALATION_RESOLVED
+
+
+@dataclass(slots=True, kw_only=True)
 class ActionAttemptedEvent(Event):
     """Represents an execution attempt by the executor."""
 
@@ -226,6 +256,66 @@ class ActionAttemptedEvent(Event):
     tool_name: str
     attempt: int
     event_type: EventType = EventType.ACTION_ATTEMPTED
+
+
+@dataclass(slots=True, kw_only=True)
+class SandboxExecutionStartedEvent(Event):
+    """Represents a tool invocation beginning inside the Executor's sandbox."""
+
+    execution_id: str
+    action_id: str
+    action_type: str
+    event_type: EventType = EventType.SANDBOX_EXECUTION_STARTED
+
+
+@dataclass(slots=True, kw_only=True)
+class SandboxExecutionCompletedEvent(Event):
+    """Represents a sandboxed tool invocation finishing, successfully or not."""
+
+    execution_id: str
+    action_id: str
+    action_type: str
+    status: str
+    result: Optional[str] = None
+    error: Optional[str] = None
+    event_type: EventType = EventType.SANDBOX_EXECUTION_COMPLETED
+
+
+@dataclass(slots=True, kw_only=True)
+class ActionRetryScheduledEvent(Event):
+    """Represents a retry being queued after a retryable action failure."""
+
+    action_id: str
+    plan_id: str
+    action_type: str
+    attempt: int
+    next_attempt: int
+    error: str
+    event_type: EventType = EventType.ACTION_RETRY_SCHEDULED
+
+
+@dataclass(slots=True, kw_only=True)
+class ActionRetryStartedEvent(Event):
+    """Represents a retry attempt beginning execution."""
+
+    action_id: str
+    plan_id: str
+    action_type: str
+    attempt: int
+    event_type: EventType = EventType.ACTION_RETRY_STARTED
+
+
+@dataclass(slots=True, kw_only=True)
+class ActionRetryExhaustedEvent(Event):
+    """Represents an action running out of retry attempts."""
+
+    action_id: str
+    plan_id: str
+    action_type: str
+    attempts_made: int
+    max_attempts: int
+    error: str
+    event_type: EventType = EventType.ACTION_RETRY_EXHAUSTED
 
 
 @dataclass(slots=True, kw_only=True)
@@ -361,6 +451,13 @@ __all__ = [
     "ConstitutionAmendmentProposedEvent",
     "ConstitutionAmendedEvent",
     "ConstitutionAmendmentRejectedEvent",
+    "EscalationCreatedEvent",
+    "EscalationResolvedEvent",
+    "SandboxExecutionStartedEvent",
+    "SandboxExecutionCompletedEvent",
+    "ActionRetryScheduledEvent",
+    "ActionRetryStartedEvent",
+    "ActionRetryExhaustedEvent",
     "ActionApprovedEvent",
     "ActionAttemptedEvent",
     "ActionSucceededEvent",

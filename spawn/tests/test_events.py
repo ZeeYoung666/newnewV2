@@ -4,6 +4,9 @@ from src.events import (
     ActionApprovedEvent,
     ActionAttemptedEvent,
     ActionFailedEvent,
+    ActionRetryExhaustedEvent,
+    ActionRetryScheduledEvent,
+    ActionRetryStartedEvent,
     ActionSucceededEvent,
     ApprovalDeniedEvent,
     ApprovalGrantedEvent,
@@ -11,6 +14,8 @@ from src.events import (
     BeliefCreatedEvent,
     BeliefUpdatedEvent,
     BudgetCheckedEvent,
+    EscalationCreatedEvent,
+    EscalationResolvedEvent,
     Event,
     EventType,
     ExecutiveDecisionEvent,
@@ -24,6 +29,8 @@ from src.events import (
     PlanAbandonedEvent,
     PlanProposedEvent,
     PolicyEvaluatedEvent,
+    SandboxExecutionCompletedEvent,
+    SandboxExecutionStartedEvent,
 )
 
 
@@ -75,6 +82,21 @@ class EventModelTests(unittest.TestCase):
             plan_id="plan-3",
             reason="no constitution configured",
         )
+        escalation_created_event = EscalationCreatedEvent(
+            source_component="governor",
+            escalation_id="escalation-1",
+            plan_id="plan-3",
+            reason="no constitution configured",
+            ordered_actions=("investigate:opp-1",),
+        )
+        escalation_resolved_event = EscalationResolvedEvent(
+            source_component="governor",
+            escalation_id="escalation-1",
+            plan_id="plan-3",
+            decision="approved",
+            resolved_by="owner",
+            reason="owner approved escalation",
+        )
         policy_evaluated_event = PolicyEvaluatedEvent(
             source_component="governor",
             plan_id="plan-1",
@@ -91,6 +113,45 @@ class EventModelTests(unittest.TestCase):
             capital_required=6.0,
             capital_available=100.0,
             sufficient=True,
+        )
+        sandbox_started_event = SandboxExecutionStartedEvent(
+            source_component="executor",
+            execution_id="execution-1",
+            action_id="action-1",
+            action_type="send_email",
+        )
+        sandbox_completed_event = SandboxExecutionCompletedEvent(
+            source_component="executor",
+            execution_id="execution-1",
+            action_id="action-1",
+            action_type="send_email",
+            status="succeeded",
+            result="sent",
+        )
+        retry_scheduled_event = ActionRetryScheduledEvent(
+            source_component="executor",
+            action_id="action-1",
+            plan_id="plan-1",
+            action_type="send_email",
+            attempt=1,
+            next_attempt=2,
+            error="transient timeout",
+        )
+        retry_started_event = ActionRetryStartedEvent(
+            source_component="executor",
+            action_id="action-1",
+            plan_id="plan-1",
+            action_type="send_email",
+            attempt=2,
+        )
+        retry_exhausted_event = ActionRetryExhaustedEvent(
+            source_component="executor",
+            action_id="action-1",
+            plan_id="plan-1",
+            action_type="send_email",
+            attempts_made=3,
+            max_attempts=3,
+            error="transient timeout",
         )
         execution_event = ActionAttemptedEvent(
             source_component="executor",
@@ -181,6 +242,13 @@ class EventModelTests(unittest.TestCase):
         self.assertEqual(approval_granted_event.event_type, EventType.APPROVAL_GRANTED)
         self.assertEqual(approval_denied_event.event_type, EventType.APPROVAL_DENIED)
         self.assertEqual(approval_required_event.event_type, EventType.APPROVAL_REQUIRED)
+        self.assertEqual(escalation_created_event.event_type, EventType.ESCALATION_CREATED)
+        self.assertEqual(escalation_resolved_event.event_type, EventType.ESCALATION_RESOLVED)
+        self.assertEqual(sandbox_started_event.event_type, EventType.SANDBOX_EXECUTION_STARTED)
+        self.assertEqual(sandbox_completed_event.event_type, EventType.SANDBOX_EXECUTION_COMPLETED)
+        self.assertEqual(retry_scheduled_event.event_type, EventType.ACTION_RETRY_SCHEDULED)
+        self.assertEqual(retry_started_event.event_type, EventType.ACTION_RETRY_STARTED)
+        self.assertEqual(retry_exhausted_event.event_type, EventType.ACTION_RETRY_EXHAUSTED)
         self.assertEqual(policy_evaluated_event.event_type, EventType.POLICY_EVALUATED)
         self.assertEqual(budget_checked_event.event_type, EventType.BUDGET_CHECKED)
         self.assertEqual(execution_event.event_type, EventType.ACTION_ATTEMPTED)

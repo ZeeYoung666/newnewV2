@@ -123,9 +123,13 @@ class BootstrapCycleTests(unittest.TestCase):
                 EventType.APPROVAL_GRANTED,
                 EventType.ACTION_APPROVED,
                 EventType.ACTION_ATTEMPTED,
+                EventType.SANDBOX_EXECUTION_STARTED,
+                EventType.SANDBOX_EXECUTION_COMPLETED,
                 EventType.ACTION_SUCCEEDED,
                 EventType.ACTION_APPROVED,
                 EventType.ACTION_ATTEMPTED,
+                EventType.SANDBOX_EXECUTION_STARTED,
+                EventType.SANDBOX_EXECUTION_COMPLETED,
                 EventType.ACTION_SUCCEEDED,
                 EventType.OUTCOME_RECORDED,
                 EventType.LEDGER_ENTRY_POSTED,
@@ -142,7 +146,7 @@ class BootstrapCycleTests(unittest.TestCase):
         cascade = self.organism.kernel.event_log.read_from(start_sequence)
         correlation_ids = {event.correlation_id for _, event in cascade}
 
-        self.assertEqual(len(cascade), 18)
+        self.assertEqual(len(cascade), 22)
         self.assertEqual(len(correlation_ids), 1)
         self.assertIsNotNone(next(iter(correlation_ids)))
 
@@ -158,8 +162,8 @@ class BootstrapCycleTests(unittest.TestCase):
         first_ids = {event.correlation_id for event in first_cascade}
         second_ids = {event.correlation_id for event in second_cascade}
 
-        self.assertEqual(len(first_cascade), 18)
-        self.assertEqual(len(second_cascade), 18)
+        self.assertEqual(len(first_cascade), 22)
+        self.assertEqual(len(second_cascade), 22)
         self.assertEqual(len(first_ids), 1)
         self.assertEqual(len(second_ids), 1)
         self.assertNotEqual(first_ids, second_ids)
