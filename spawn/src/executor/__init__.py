@@ -20,6 +20,9 @@ from src.events import (
     ActionRetryStartedEvent,
     ActionSucceededEvent,
     ApprovalGrantedEvent,
+    CredentialRegisteredEvent,
+    CredentialRevokedEvent,
+    CredentialUpdatedEvent,
     EventType,
     SandboxExecutionCompletedEvent,
     SandboxExecutionStartedEvent,
@@ -27,6 +30,17 @@ from src.events import (
 from src.kernel import Kernel
 
 Tool = Callable[["Action"], object]
+CredentialedTool = Callable[["Action", str], object]
+
+
+def _bind_credential(tool: CredentialedTool, value: str) -> Tool:
+    """Wrap a credentialed tool into the plain `Tool` shape the Sandbox expects.
+
+    The credential value is bound into this one closure, scoped to a single
+    execution — the Sandbox only ever sees the resulting callable, never
+    the credential itself, and never anything persisted.
+    """
+    return lambda action: tool(action, value)
 
 
 class RetryableError(Exception):
@@ -246,6 +260,69 @@ class RetryManager:
                 self._attempts[record.action_id] = record.attempt
 
 
+@dataclass(slots=True, kw_only=True, frozen=True)
+class Credential:
+    """Immutable credential value scoped to a single action type.
+
+    Owned exclusively by the Executor; never exposed to the Sandbox, the
+    ToolRegistry, or any other component.
+    """
+
+    credential_id: str
+    action_type: str
+    value: str
+    status: str
+    updated_at: datetime
+
+
+class CredentialStore:
+    """Current-state store of credentials, keyed by action_type.
+
+    Owned exclusively by the Executor. Mutated only inside the Executor's
+    subscribers for the credential lifecycle events (registered, updated,
+    revoked) — the public registration API only publishes, so replay and
+    snapshot restore reconstruct this store with no special-cased code.
+    Once a credential is registered for an action_type, that action_type
+    requires an active credential for every execution from then on,
+    including after revocation. `require()` lets an action_type be marked
+    as credential-required before any value is ever registered — bootstrap
+    configuration, like a ToolRegistry registration, not event-sourced.
+    """
+
+    def __init__(self) -> None:
+        self._credentials: dict[str, Credential] = {}
+        self._required_action_types: set[str] = set()
+
+    def require(self, action_type: str) -> None:
+        self._required_action_types.add(action_type)
+
+    def is_required(self, action_type: str) -> bool:
+        return action_type in self._required_action_types or action_type in self._credentials
+
+    def put(self, credential: Credential) -> None:
+        self._credentials[credential.action_type] = credential
+
+    def exists(self, action_type: str) -> bool:
+        return action_type in self._credentials
+
+    def get(self, action_type: str) -> Credential:
+        return self._credentials[action_type]
+
+    def get_active(self, action_type: str) -> Credential:
+        """Return the currently active credential for an action_type.
+
+        Raises KeyError if no credential was ever registered for it, or
+        LookupError if the registered credential has since been revoked.
+        """
+        credential = self._credentials[action_type]
+        if credential.status != "active":
+            raise LookupError(f"credential for action_type '{action_type}' is revoked")
+        return credential
+
+    def read_all(self) -> list[Credential]:
+        return list(self._credentials.values())
+
+
 def _parse_ordered_action(ordered_action: str) -> tuple[str, dict[str, str]]:
     action_type, _, target = ordered_action.partition(":")
     parameters = {"target": target} if target else {}
@@ -262,6 +339,7 @@ class Executor:
         self.action_log = ActionLog()
         self.sandbox_execution_log = SandboxExecutionLog()
         self.retry_manager = RetryManager()
+        self.credential_store = CredentialStore()
         self._pending_sandbox_executions: dict[str, SandboxExecutionRecord] = {}
         kernel.register_subscriber(EventType.APPROVAL_GRANTED, self._on_approval_granted)
         kernel.register_subscriber(EventType.SANDBOX_EXECUTION_STARTED, self._on_sandbox_execution_started)
@@ -269,6 +347,9 @@ class Executor:
         kernel.register_subscriber(EventType.ACTION_RETRY_SCHEDULED, self._on_action_retry_scheduled)
         kernel.register_subscriber(EventType.ACTION_RETRY_STARTED, self._on_action_retry_started)
         kernel.register_subscriber(EventType.ACTION_RETRY_EXHAUSTED, self._on_action_retry_exhausted)
+        kernel.register_subscriber(EventType.CREDENTIAL_REGISTERED, self._on_credential_registered)
+        kernel.register_subscriber(EventType.CREDENTIAL_UPDATED, self._on_credential_updated)
+        kernel.register_subscriber(EventType.CREDENTIAL_REVOKED, self._on_credential_revoked)
         kernel.register_snapshot_source(
             "executor.actions", ActionRecord, self.action_log.read_all, self._restore_actions
         )
@@ -280,6 +361,9 @@ class Executor:
         )
         kernel.register_snapshot_source(
             "executor.retries", RetryRecord, self.retry_manager.retry_log.read_all, self.retry_manager.restore
+        )
+        kernel.register_snapshot_source(
+            "executor.credentials", Credential, self.credential_store.read_all, self._restore_credentials
         )
 
     def _restore_actions(self, records: list[ActionRecord]) -> None:
@@ -297,6 +381,96 @@ class Executor:
             for execution_id, record in latest_by_id.items()
             if record.status == "started"
         }
+
+    def _restore_credentials(self, records: list[Credential]) -> None:
+        for record in records:
+            self.credential_store.put(record)
+
+    def require_credential(self, action_type: str) -> None:
+        """Declare that executing action_type requires an active credential.
+
+        Bootstrap configuration, like a ToolRegistry registration — not
+        event-sourced, since no credential value exists yet to source.
+        """
+        self.credential_store.require(action_type)
+
+    def register_credential(self, *, action_type: str, value: str) -> str:
+        """Register a new active credential for an action_type.
+
+        From this point on, executing that action_type requires an active
+        credential. Publishes CredentialRegisteredEvent, which is what
+        actually stores it (via this Executor's own subscriber), so
+        registration is replay-correct. Returns the new credential_id.
+        """
+        credential_id = str(uuid4())
+        self._kernel.publish(
+            CredentialRegisteredEvent(
+                source_component="executor", credential_id=credential_id, action_type=action_type, value=value
+            )
+        )
+        return credential_id
+
+    def update_credential(self, action_type: str, *, value: str) -> None:
+        """Replace the active credential's value for an action_type.
+
+        Raises KeyError if no credential was ever registered for it. Only
+        affects executions from this point forward.
+        """
+        current = self.credential_store.get(action_type)
+        self._kernel.publish(
+            CredentialUpdatedEvent(
+                source_component="executor",
+                credential_id=current.credential_id,
+                action_type=action_type,
+                value=value,
+            )
+        )
+
+    def revoke_credential(self, action_type: str) -> None:
+        """Revoke the active credential for an action_type.
+
+        Raises KeyError if no credential was ever registered for it.
+        """
+        current = self.credential_store.get(action_type)
+        self._kernel.publish(
+            CredentialRevokedEvent(
+                source_component="executor", credential_id=current.credential_id, action_type=action_type
+            )
+        )
+
+    def _on_credential_registered(self, event: CredentialRegisteredEvent) -> None:
+        self.credential_store.put(
+            Credential(
+                credential_id=event.credential_id,
+                action_type=event.action_type,
+                value=event.value,
+                status="active",
+                updated_at=event.timestamp,
+            )
+        )
+
+    def _on_credential_updated(self, event: CredentialUpdatedEvent) -> None:
+        self.credential_store.put(
+            Credential(
+                credential_id=event.credential_id,
+                action_type=event.action_type,
+                value=event.value,
+                status="active",
+                updated_at=event.timestamp,
+            )
+        )
+
+    def _on_credential_revoked(self, event: CredentialRevokedEvent) -> None:
+        current = self.credential_store.get(event.action_type)
+        self.credential_store.put(
+            Credential(
+                credential_id=event.credential_id,
+                action_type=event.action_type,
+                value=current.value,
+                status="revoked",
+                updated_at=event.timestamp,
+            )
+        )
 
     def _on_approval_granted(self, event: ApprovalGrantedEvent) -> None:
         for ordered_action in event.ordered_actions:
@@ -334,6 +508,17 @@ class Executor:
         except KeyError:
             self._record_failure(action, f"no tool registered for action_type '{action_type}'")
             return
+
+        if self.credential_store.is_required(action_type):
+            try:
+                credential = self.credential_store.get_active(action_type)
+            except KeyError:
+                self._record_failure(action, f"no credential registered for action_type '{action_type}'")
+                return
+            except LookupError as exc:
+                self._record_failure(action, str(exc))
+                return
+            tool = _bind_credential(tool, credential.value)
 
         attempt = 1
         while True:
@@ -532,5 +717,7 @@ __all__ = [
     "RetryRecord",
     "RetryLog",
     "RetryManager",
+    "Credential",
+    "CredentialStore",
     "Executor",
 ]

@@ -36,6 +36,9 @@ class EventType(str, Enum):
     ACTION_RETRY_SCHEDULED = "action.retry_scheduled"
     ACTION_RETRY_STARTED = "action.retry_started"
     ACTION_RETRY_EXHAUSTED = "action.retry_exhausted"
+    CREDENTIAL_REGISTERED = "credential.registered"
+    CREDENTIAL_UPDATED = "credential.updated"
+    CREDENTIAL_REVOKED = "credential.revoked"
     ACTION_SUCCEEDED = "action.succeeded"
     ACTION_FAILED = "action.failed"
     OUTCOME_RECORDED = "outcome.recorded"
@@ -319,6 +322,35 @@ class ActionRetryExhaustedEvent(Event):
 
 
 @dataclass(slots=True, kw_only=True)
+class CredentialRegisteredEvent(Event):
+    """Represents a new credential becoming the active one for an action_type."""
+
+    credential_id: str
+    action_type: str
+    value: str
+    event_type: EventType = EventType.CREDENTIAL_REGISTERED
+
+
+@dataclass(slots=True, kw_only=True)
+class CredentialUpdatedEvent(Event):
+    """Represents the active credential for an action_type being replaced with a new value."""
+
+    credential_id: str
+    action_type: str
+    value: str
+    event_type: EventType = EventType.CREDENTIAL_UPDATED
+
+
+@dataclass(slots=True, kw_only=True)
+class CredentialRevokedEvent(Event):
+    """Represents the active credential for an action_type being revoked."""
+
+    credential_id: str
+    action_type: str
+    event_type: EventType = EventType.CREDENTIAL_REVOKED
+
+
+@dataclass(slots=True, kw_only=True)
 class ActionApprovedEvent(Event):
     """Represents an action authorized to run as part of an approved plan."""
 
@@ -458,6 +490,9 @@ __all__ = [
     "ActionRetryScheduledEvent",
     "ActionRetryStartedEvent",
     "ActionRetryExhaustedEvent",
+    "CredentialRegisteredEvent",
+    "CredentialUpdatedEvent",
+    "CredentialRevokedEvent",
     "ActionApprovedEvent",
     "ActionAttemptedEvent",
     "ActionSucceededEvent",

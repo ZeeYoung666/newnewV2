@@ -11,6 +11,9 @@ from src.events import (
     ActionRetryStartedEvent,
     ActionSucceededEvent,
     ApprovalGrantedEvent,
+    CredentialRegisteredEvent,
+    CredentialRevokedEvent,
+    CredentialUpdatedEvent,
     Event,
     EventType,
     PlanProposedEvent,
@@ -21,6 +24,8 @@ from src.executor import (
     Action,
     ActionLog,
     ActionRecord,
+    Credential,
+    CredentialStore,
     Executor,
     LocalSandbox,
     RetryableError,
@@ -893,6 +898,288 @@ class ExecutorRetrySnapshotTests(unittest.TestCase):
             [record.status for record in restored_records], ["scheduled", "started", "scheduled", "started"]
         )
         self.assertEqual(rebuilt_executor.action_log.read_all(), executor.action_log.read_all())
+
+
+class CredentialModelTests(unittest.TestCase):
+    def test_credential_carries_required_fields(self) -> None:
+        now = datetime.now(timezone.utc)
+        credential = Credential(
+            credential_id="credential-1",
+            action_type="send_email",
+            value="secret-token",
+            status="active",
+            updated_at=now,
+        )
+
+        self.assertEqual(credential.credential_id, "credential-1")
+        self.assertEqual(credential.action_type, "send_email")
+        self.assertEqual(credential.value, "secret-token")
+        self.assertEqual(credential.status, "active")
+        self.assertEqual(credential.updated_at, now)
+
+    def test_credential_is_immutable(self) -> None:
+        credential = Credential(
+            credential_id="credential-1",
+            action_type="send_email",
+            value="secret-token",
+            status="active",
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            credential.status = "revoked"  # type: ignore[misc]
+
+
+class CredentialStoreTests(unittest.TestCase):
+    def test_put_get_exists_and_read_all(self) -> None:
+        store = CredentialStore()
+        credential = Credential(
+            credential_id="credential-1",
+            action_type="send_email",
+            value="secret-token",
+            status="active",
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        store.put(credential)
+
+        self.assertTrue(store.exists("send_email"))
+        self.assertEqual(store.get("send_email"), credential)
+        self.assertEqual(store.read_all(), [credential])
+
+    def test_get_raises_for_unknown_action_type(self) -> None:
+        store = CredentialStore()
+
+        with self.assertRaises(KeyError):
+            store.get("unknown")
+
+    def test_get_active_raises_keyerror_when_never_registered(self) -> None:
+        store = CredentialStore()
+
+        with self.assertRaises(KeyError):
+            store.get_active("send_email")
+
+    def test_get_active_raises_lookuperror_when_revoked(self) -> None:
+        store = CredentialStore()
+        store.put(
+            Credential(
+                credential_id="credential-1",
+                action_type="send_email",
+                value="secret-token",
+                status="revoked",
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+
+        with self.assertRaises(LookupError):
+            store.get_active("send_email")
+
+    def test_is_required_true_once_a_credential_is_registered(self) -> None:
+        store = CredentialStore()
+        self.assertFalse(store.is_required("send_email"))
+
+        store.put(
+            Credential(
+                credential_id="credential-1",
+                action_type="send_email",
+                value="secret-token",
+                status="active",
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+
+        self.assertTrue(store.is_required("send_email"))
+
+    def test_require_marks_action_type_required_without_a_value(self) -> None:
+        store = CredentialStore()
+        store.require("send_email")
+
+        self.assertTrue(store.is_required("send_email"))
+        self.assertFalse(store.exists("send_email"))
+
+
+class ExecutorCredentialInjectionTests(unittest.TestCase):
+    def test_correct_credential_is_injected_for_tool_execution(self) -> None:
+        kernel = Kernel()
+        executor = Executor(kernel)
+        received: list[str] = []
+
+        def send_email(action: Action, credential: str) -> str:
+            received.append(credential)
+            return f"sent using {credential}"
+
+        executor.tool_registry.register("send_email", send_email)
+        executor.register_credential(action_type="send_email", value="api-key-123")
+
+        succeeded: list[Event] = []
+        kernel.register_subscriber(EventType.ACTION_SUCCEEDED, succeeded.append)
+
+        publish_approval_granted(kernel, plan_id="plan-1", ordered_actions=("send_email:owner",))
+
+        self.assertEqual(received, ["api-key-123"])
+        self.assertEqual(len(succeeded), 1)
+        self.assertEqual(succeeded[0].result, "sent using api-key-123")
+
+    def test_action_types_without_a_credential_execute_unaffected(self) -> None:
+        kernel = Kernel()
+        executor = Executor(kernel)
+        executor.tool_registry.register("investigate", lambda action: "found-it")
+
+        succeeded: list[Event] = []
+        kernel.register_subscriber(EventType.ACTION_SUCCEEDED, succeeded.append)
+
+        publish_approval_granted(kernel, plan_id="plan-1", ordered_actions=("investigate:opportunity-1",))
+
+        self.assertEqual(len(succeeded), 1)
+        self.assertEqual(succeeded[0].result, "found-it")
+
+    def test_missing_credential_fails_before_sandbox_execution(self) -> None:
+        kernel = Kernel()
+        sandbox = RecordingSandbox()
+        executor = Executor(kernel, sandbox=sandbox)
+        executor.require_credential("send_email")
+        executor.tool_registry.register("send_email", lambda action, credential: "unreachable")
+
+        failed: list[Event] = []
+        kernel.register_subscriber(EventType.ACTION_FAILED, failed.append)
+
+        publish_approval_granted(kernel, plan_id="plan-1", ordered_actions=("send_email:owner",))
+
+        self.assertEqual(sandbox.calls, [])
+        self.assertEqual(len(failed), 1)
+        self.assertIn("no credential registered", failed[0].error)
+
+        records = executor.action_log.read_all()
+        self.assertEqual(records[0].status, "failed")
+
+    def test_revoked_credential_cannot_be_used(self) -> None:
+        kernel = Kernel()
+        sandbox = RecordingSandbox()
+        executor = Executor(kernel, sandbox=sandbox)
+        executor.tool_registry.register("send_email", lambda action, credential: "unreachable")
+        executor.register_credential(action_type="send_email", value="api-key-123")
+        executor.revoke_credential("send_email")
+
+        failed: list[Event] = []
+        kernel.register_subscriber(EventType.ACTION_FAILED, failed.append)
+
+        publish_approval_granted(kernel, plan_id="plan-1", ordered_actions=("send_email:owner",))
+
+        self.assertEqual(sandbox.calls, [])
+        self.assertEqual(len(failed), 1)
+        self.assertIn("revoked", failed[0].error)
+
+    def test_credential_update_affects_future_executions_only(self) -> None:
+        kernel = Kernel()
+        executor = Executor(kernel)
+        received: list[str] = []
+
+        def send_email(action: Action, credential: str) -> str:
+            received.append(credential)
+            return "sent"
+
+        executor.tool_registry.register("send_email", send_email)
+        executor.register_credential(action_type="send_email", value="old-key")
+
+        publish_approval_granted(kernel, plan_id="plan-1", ordered_actions=("send_email:owner",))
+
+        executor.update_credential("send_email", value="new-key")
+
+        publish_approval_granted(kernel, plan_id="plan-2", ordered_actions=("send_email:owner",))
+
+        self.assertEqual(received, ["old-key", "new-key"])
+
+    def test_register_update_and_revoke_raise_for_unregistered_action_type(self) -> None:
+        kernel = Kernel()
+        executor = Executor(kernel)
+
+        with self.assertRaises(KeyError):
+            executor.update_credential("send_email", value="new-key")
+
+        with self.assertRaises(KeyError):
+            executor.revoke_credential("send_email")
+
+    def test_registration_update_and_revocation_events_are_emitted(self) -> None:
+        kernel = Kernel()
+        executor = Executor(kernel)
+        executor.tool_registry.register("send_email", lambda action, credential: "sent")
+
+        registered: list[Event] = []
+        updated: list[Event] = []
+        revoked: list[Event] = []
+        kernel.register_subscriber(EventType.CREDENTIAL_REGISTERED, registered.append)
+        kernel.register_subscriber(EventType.CREDENTIAL_UPDATED, updated.append)
+        kernel.register_subscriber(EventType.CREDENTIAL_REVOKED, revoked.append)
+
+        credential_id = executor.register_credential(action_type="send_email", value="key-1")
+        executor.update_credential("send_email", value="key-2")
+        executor.revoke_credential("send_email")
+
+        self.assertEqual(len(registered), 1)
+        self.assertIsInstance(registered[0], CredentialRegisteredEvent)
+        self.assertEqual(registered[0].credential_id, credential_id)
+
+        self.assertEqual(len(updated), 1)
+        self.assertIsInstance(updated[0], CredentialUpdatedEvent)
+        self.assertEqual(updated[0].value, "key-2")
+
+        self.assertEqual(len(revoked), 1)
+        self.assertIsInstance(revoked[0], CredentialRevokedEvent)
+
+        credential = executor.credential_store.get("send_email")
+        self.assertEqual(credential.status, "revoked")
+        self.assertEqual(credential.value, "key-2")
+
+
+class ExecutorCredentialReplayTests(unittest.TestCase):
+    def test_replay_reconstructs_credential_state(self) -> None:
+        event_log = EventLog()
+        kernel = Kernel(event_log=event_log)
+        executor = Executor(kernel)
+        executor.tool_registry.register("send_email", lambda action, credential: "sent")
+
+        executor.register_credential(action_type="send_email", value="key-1")
+        executor.update_credential("send_email", value="key-2")
+        executor.register_credential(action_type="log_event", value="log-key")
+        executor.revoke_credential("log_event")
+
+        rebuilt_kernel = Kernel(event_log=event_log)
+        rebuilt_executor = Executor(rebuilt_kernel)
+        rebuilt_executor.tool_registry.register("send_email", lambda action, credential: "sent")
+        rebuilt_kernel.replay()
+
+        send_email_credential = rebuilt_executor.credential_store.get("send_email")
+        self.assertEqual(send_email_credential.status, "active")
+        self.assertEqual(send_email_credential.value, "key-2")
+
+        log_event_credential = rebuilt_executor.credential_store.get("log_event")
+        self.assertEqual(log_event_credential.status, "revoked")
+        self.assertEqual(log_event_credential.value, "log-key")
+
+
+class ExecutorCredentialSnapshotTests(unittest.TestCase):
+    def test_snapshot_restore_reconstructs_credential_state(self) -> None:
+        kernel = Kernel()
+        executor = Executor(kernel)
+        executor.tool_registry.register("send_email", lambda action, credential: "sent")
+
+        executor.register_credential(action_type="send_email", value="key-1")
+        executor.update_credential("send_email", value="key-2")
+        executor.register_credential(action_type="log_event", value="log-key")
+        executor.revoke_credential("log_event")
+        kernel.create_snapshot()
+
+        rebuilt_kernel = Kernel(event_log=kernel.event_log, snapshot_store=kernel.snapshot_store)
+        rebuilt_executor = Executor(rebuilt_kernel)
+        rebuilt_kernel.replay()
+
+        send_email_credential = rebuilt_executor.credential_store.get("send_email")
+        self.assertEqual(send_email_credential.status, "active")
+        self.assertEqual(send_email_credential.value, "key-2")
+
+        log_event_credential = rebuilt_executor.credential_store.get("log_event")
+        self.assertEqual(log_event_credential.status, "revoked")
+        self.assertEqual(log_event_credential.value, "log-key")
 
 
 if __name__ == "__main__":

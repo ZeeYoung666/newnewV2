@@ -14,6 +14,9 @@ from src.events import (
     BeliefCreatedEvent,
     BeliefUpdatedEvent,
     BudgetCheckedEvent,
+    CredentialRegisteredEvent,
+    CredentialRevokedEvent,
+    CredentialUpdatedEvent,
     EscalationCreatedEvent,
     EscalationResolvedEvent,
     Event,
@@ -153,6 +156,23 @@ class EventModelTests(unittest.TestCase):
             max_attempts=3,
             error="transient timeout",
         )
+        credential_registered_event = CredentialRegisteredEvent(
+            source_component="executor",
+            credential_id="credential-1",
+            action_type="send_email",
+            value="api-key-123",
+        )
+        credential_updated_event = CredentialUpdatedEvent(
+            source_component="executor",
+            credential_id="credential-1",
+            action_type="send_email",
+            value="api-key-456",
+        )
+        credential_revoked_event = CredentialRevokedEvent(
+            source_component="executor",
+            credential_id="credential-1",
+            action_type="send_email",
+        )
         execution_event = ActionAttemptedEvent(
             source_component="executor",
             action_id="action-1",
@@ -249,6 +269,9 @@ class EventModelTests(unittest.TestCase):
         self.assertEqual(retry_scheduled_event.event_type, EventType.ACTION_RETRY_SCHEDULED)
         self.assertEqual(retry_started_event.event_type, EventType.ACTION_RETRY_STARTED)
         self.assertEqual(retry_exhausted_event.event_type, EventType.ACTION_RETRY_EXHAUSTED)
+        self.assertEqual(credential_registered_event.event_type, EventType.CREDENTIAL_REGISTERED)
+        self.assertEqual(credential_updated_event.event_type, EventType.CREDENTIAL_UPDATED)
+        self.assertEqual(credential_revoked_event.event_type, EventType.CREDENTIAL_REVOKED)
         self.assertEqual(policy_evaluated_event.event_type, EventType.POLICY_EVALUATED)
         self.assertEqual(budget_checked_event.event_type, EventType.BUDGET_CHECKED)
         self.assertEqual(execution_event.event_type, EventType.ACTION_ATTEMPTED)
