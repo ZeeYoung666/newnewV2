@@ -24,6 +24,8 @@ from src.events import (
     ExecutiveDecisionEvent,
     InferenceCompletedEvent,
     InferenceRequestedEvent,
+    KnowledgeRevisionCompletedEvent,
+    KnowledgeRevisionStartedEvent,
     LearningIterationCompletedEvent,
     LearningIterationStartedEvent,
     LedgerEntryPostedEvent,
@@ -204,6 +206,18 @@ class EventModelTests(unittest.TestCase):
             mean_prediction_error=-4.5,
             heuristic_id="heuristic-1",
         )
+        knowledge_revision_started_event = KnowledgeRevisionStartedEvent(
+            source_component="memory_ledger",
+            revision_id="revision-1",
+            heuristics_considered=3,
+        )
+        knowledge_revision_completed_event = KnowledgeRevisionCompletedEvent(
+            source_component="memory_ledger",
+            revision_id="revision-1",
+            heuristics_considered=3,
+            consensus_confidence=0.42,
+            knowledge_id="knowledge-1",
+        )
         execution_event = ActionAttemptedEvent(
             source_component="executor",
             action_id="action-1",
@@ -307,6 +321,8 @@ class EventModelTests(unittest.TestCase):
         self.assertEqual(prediction_resolved_event.event_type, EventType.PREDICTION_RESOLVED)
         self.assertEqual(learning_iteration_started_event.event_type, EventType.LEARNING_ITERATION_STARTED)
         self.assertEqual(learning_iteration_completed_event.event_type, EventType.LEARNING_ITERATION_COMPLETED)
+        self.assertEqual(knowledge_revision_started_event.event_type, EventType.KNOWLEDGE_REVISION_STARTED)
+        self.assertEqual(knowledge_revision_completed_event.event_type, EventType.KNOWLEDGE_REVISION_COMPLETED)
         self.assertEqual(policy_evaluated_event.event_type, EventType.POLICY_EVALUATED)
         self.assertEqual(budget_checked_event.event_type, EventType.BUDGET_CHECKED)
         self.assertEqual(execution_event.event_type, EventType.ACTION_ATTEMPTED)

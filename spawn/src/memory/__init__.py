@@ -3,9 +3,10 @@
 Owns episodic memory, the financial ledger, prediction history, and learned
 heuristics. Reacts to executed actions and resolves predictions against
 their outcomes, running the Medium Learning Loop to revise heuristics from
-accumulated prediction error. Never updates the Executive, Governor,
-Executor, or World Model directly, and does not (yet) distill playbooks or
-anti-patterns — that is the Slow Learning Loop's job.
+accumulated prediction error, and periodically running the Slow Learning
+Loop to consolidate accumulated heuristic history into durable long-term
+knowledge. Never updates the Executive, Governor, Executor, or World Model
+directly.
 """
 
 from __future__ import annotations
@@ -19,6 +20,8 @@ from src.events import (
     ActionFailedEvent,
     ActionSucceededEvent,
     EventType,
+    KnowledgeRevisionCompletedEvent,
+    KnowledgeRevisionStartedEvent,
     LearningIterationCompletedEvent,
     LearningIterationStartedEvent,
     LedgerEntryPostedEvent,
@@ -246,6 +249,99 @@ class MediumLearner:
         )
 
 
+@dataclass(slots=True, kw_only=True, frozen=True)
+class KnowledgeRevision:
+    """An immutable audit trail entry for one Slow Learning Loop consolidation pass.
+
+    Mirrors LearningIteration's shape-evolution pattern: one record is
+    appended per transition (started, then completed) — never mutated —
+    so the full history survives in KnowledgeLedger even though `status`
+    only ever describes that single transition.
+    """
+
+    revision_id: str
+    status: str
+    heuristics_considered: int
+    started_at: datetime
+    completed_at: Optional[datetime] = None
+    consensus_confidence: Optional[float] = None
+    knowledge_id: Optional[str] = None
+
+
+class KnowledgeLedger:
+    """Append-only log of Slow Learning Loop revision transitions.
+
+    A revision_id can appear more than once (started, then completed) —
+    read_all() returns every transition ever recorded, in order.
+    """
+
+    def __init__(self) -> None:
+        self._records: list[KnowledgeRevision] = []
+
+    def append(self, record: KnowledgeRevision) -> None:
+        self._records.append(record)
+
+    def read_all(self) -> list[KnowledgeRevision]:
+        return list(self._records)
+
+    def history_for(self, revision_id: str) -> list[KnowledgeRevision]:
+        """All transitions recorded for a single revision, in order."""
+        return [record for record in self._records if record.revision_id == revision_id]
+
+
+@dataclass(slots=True, kw_only=True, frozen=True)
+class LongTermKnowledge:
+    """A durable, consolidated piece of knowledge distilled from heuristic history."""
+
+    knowledge_id: str
+    summary: str
+    consensus_confidence: float
+    heuristics_considered: int
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class LongTermKnowledgeStore:
+    """Append-only store of durable, consolidated long-term knowledge."""
+
+    def __init__(self) -> None:
+        self._entries: list[LongTermKnowledge] = []
+
+    def append(self, entry: LongTermKnowledge) -> None:
+        self._entries.append(entry)
+
+    def read_all(self) -> list[LongTermKnowledge]:
+        return list(self._entries)
+
+
+class SlowLearner:
+    """Deterministic, stateless computation for the Slow Learning Loop.
+
+    Owns no store of its own — MemoryLedger owns KnowledgeLedger and
+    LongTermKnowledgeStore. Given the same heuristic history, this always
+    returns the same values, which is what makes replay and repeated runs
+    over identical history produce identical knowledge revisions.
+    """
+
+    CONSOLIDATION_INTERVAL = 3
+
+    def should_consolidate(self, heuristics_considered: int) -> bool:
+        """Periodic trigger: consolidate every CONSOLIDATION_INTERVAL accumulated heuristics."""
+        return heuristics_considered > 0 and heuristics_considered % self.CONSOLIDATION_INTERVAL == 0
+
+    def compute_consensus_confidence(self, heuristics: list[Heuristic]) -> float:
+        """The mean confidence across every heuristic handed in."""
+        confidences = [heuristic.confidence for heuristic in heuristics]
+        if not confidences:
+            return 0.0
+        return sum(confidences) / len(confidences)
+
+    def describe(self, *, consensus_confidence: float, heuristics_considered: int) -> str:
+        return (
+            f"knowledge consolidation: consensus confidence {consensus_confidence:.6f} "
+            f"over {heuristics_considered} heuristics"
+        )
+
+
 class MemoryLedger:
     """Records outcomes, episodic memory, and ledger entries for every executed action."""
 
@@ -258,6 +354,9 @@ class MemoryLedger:
         self.prediction_ledger = PredictionLedger()
         self.learning_ledger = LearningLedger()
         self.medium_learner = MediumLearner()
+        self.knowledge_ledger = KnowledgeLedger()
+        self.long_term_knowledge_store = LongTermKnowledgeStore()
+        self.slow_learner = SlowLearner()
         self._pending_predictions: dict[str, PredictionRecord] = {}
         kernel.register_subscriber(EventType.ACTION_SUCCEEDED, self._on_action_succeeded)
         kernel.register_subscriber(EventType.ACTION_FAILED, self._on_action_failed)
@@ -267,6 +366,8 @@ class MemoryLedger:
         kernel.register_subscriber(EventType.PREDICTION_RESOLVED, self._on_prediction_resolved)
         kernel.register_subscriber(EventType.LEARNING_ITERATION_STARTED, self._on_learning_iteration_started)
         kernel.register_subscriber(EventType.LEARNING_ITERATION_COMPLETED, self._on_learning_iteration_completed)
+        kernel.register_subscriber(EventType.KNOWLEDGE_REVISION_STARTED, self._on_knowledge_revision_started)
+        kernel.register_subscriber(EventType.KNOWLEDGE_REVISION_COMPLETED, self._on_knowledge_revision_completed)
         kernel.register_snapshot_source(
             "memory.outcomes", Outcome, self.outcome_store.read_all, self._restore_outcomes
         )
@@ -290,6 +391,18 @@ class MemoryLedger:
         )
         kernel.register_snapshot_source(
             "memory.heuristics", Heuristic, self.heuristic_store.read_all, self._restore_heuristics
+        )
+        kernel.register_snapshot_source(
+            "memory.knowledge_revisions",
+            KnowledgeRevision,
+            self.knowledge_ledger.read_all,
+            self._restore_knowledge_revisions,
+        )
+        kernel.register_snapshot_source(
+            "memory.long_term_knowledge",
+            LongTermKnowledge,
+            self.long_term_knowledge_store.read_all,
+            self._restore_long_term_knowledge,
         )
 
     def _restore_outcomes(self, outcomes: list[Outcome]) -> None:
@@ -321,6 +434,14 @@ class MemoryLedger:
         self._pending_predictions = {
             plan_id: record for plan_id, record in latest_by_plan.items() if record.status == "pending"
         }
+
+    def _restore_knowledge_revisions(self, records: list[KnowledgeRevision]) -> None:
+        for record in records:
+            self.knowledge_ledger.append(record)
+
+    def _restore_long_term_knowledge(self, entries: list[LongTermKnowledge]) -> None:
+        for entry in entries:
+            self.long_term_knowledge_store.append(entry)
 
     def _on_plan_proposed(self, event: PlanProposedEvent) -> None:
         """Record a prediction before execution: the plan's expected value.
@@ -449,6 +570,66 @@ class MemoryLedger:
                     predictions_considered=event.predictions_considered,
                 ),
                 confidence=self.medium_learner.compute_confidence(event.predictions_considered),
+                created_at=event.timestamp,
+            )
+        )
+
+        # Every completed Medium Learning iteration is one tick of the Slow
+        # Learning Loop's periodic check: publishing here (rather than
+        # mutating directly) is what keeps consolidation replay-correct.
+        heuristics_considered = len(self.heuristic_store.read_all())
+        if self.slow_learner.should_consolidate(heuristics_considered):
+            self._kernel.publish(
+                KnowledgeRevisionStartedEvent(
+                    source_component="memory_ledger",
+                    revision_id=str(uuid4()),
+                    heuristics_considered=heuristics_considered,
+                )
+            )
+
+    def _on_knowledge_revision_started(self, event: KnowledgeRevisionStartedEvent) -> None:
+        self.knowledge_ledger.append(
+            KnowledgeRevision(
+                revision_id=event.revision_id,
+                status="started",
+                heuristics_considered=event.heuristics_considered,
+                started_at=event.timestamp,
+            )
+        )
+
+        consensus_confidence = self.slow_learner.compute_consensus_confidence(self.heuristic_store.read_all())
+        self._kernel.publish(
+            KnowledgeRevisionCompletedEvent(
+                source_component="memory_ledger",
+                revision_id=event.revision_id,
+                heuristics_considered=event.heuristics_considered,
+                consensus_confidence=consensus_confidence,
+                knowledge_id=str(uuid4()),
+            )
+        )
+
+    def _on_knowledge_revision_completed(self, event: KnowledgeRevisionCompletedEvent) -> None:
+        proposed = self.knowledge_ledger.history_for(event.revision_id)[0]
+        self.knowledge_ledger.append(
+            KnowledgeRevision(
+                revision_id=event.revision_id,
+                status="completed",
+                heuristics_considered=event.heuristics_considered,
+                started_at=proposed.started_at,
+                completed_at=event.timestamp,
+                consensus_confidence=event.consensus_confidence,
+                knowledge_id=event.knowledge_id,
+            )
+        )
+        self.long_term_knowledge_store.append(
+            LongTermKnowledge(
+                knowledge_id=event.knowledge_id,
+                summary=self.slow_learner.describe(
+                    consensus_confidence=event.consensus_confidence,
+                    heuristics_considered=event.heuristics_considered,
+                ),
+                consensus_confidence=event.consensus_confidence,
+                heuristics_considered=event.heuristics_considered,
                 created_at=event.timestamp,
             )
         )

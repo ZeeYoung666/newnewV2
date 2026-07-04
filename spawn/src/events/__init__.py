@@ -46,6 +46,8 @@ class EventType(str, Enum):
     PREDICTION_RESOLVED = "prediction.resolved"
     LEARNING_ITERATION_STARTED = "learning.iteration_started"
     LEARNING_ITERATION_COMPLETED = "learning.iteration_completed"
+    KNOWLEDGE_REVISION_STARTED = "knowledge.revision_started"
+    KNOWLEDGE_REVISION_COMPLETED = "knowledge.revision_completed"
     LEDGER_ENTRY_POSTED = "ledger.entry_posted"
     INFERENCE_REQUESTED = "inference.requested"
     INFERENCE_COMPLETED = "inference.completed"
@@ -440,6 +442,26 @@ class LearningIterationCompletedEvent(Event):
 
 
 @dataclass(slots=True, kw_only=True)
+class KnowledgeRevisionStartedEvent(Event):
+    """Represents the Slow Learning Loop beginning a consolidation pass over accumulated heuristic history."""
+
+    revision_id: str
+    heuristics_considered: int
+    event_type: EventType = EventType.KNOWLEDGE_REVISION_STARTED
+
+
+@dataclass(slots=True, kw_only=True)
+class KnowledgeRevisionCompletedEvent(Event):
+    """Represents the Slow Learning Loop finishing a consolidation pass with newly distilled long-term knowledge."""
+
+    revision_id: str
+    heuristics_considered: int
+    consensus_confidence: float
+    knowledge_id: str
+    event_type: EventType = EventType.KNOWLEDGE_REVISION_COMPLETED
+
+
+@dataclass(slots=True, kw_only=True)
 class LedgerEntryPostedEvent(Event):
     """Represents a financial ledger entry posted for an executed action."""
 
@@ -549,6 +571,8 @@ __all__ = [
     "PredictionResolvedEvent",
     "LearningIterationStartedEvent",
     "LearningIterationCompletedEvent",
+    "KnowledgeRevisionStartedEvent",
+    "KnowledgeRevisionCompletedEvent",
     "LedgerEntryPostedEvent",
     "InferenceRequestedEvent",
     "InferenceCompletedEvent",

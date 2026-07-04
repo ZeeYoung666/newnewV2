@@ -7,6 +7,8 @@ from src.events import (
     ActionSucceededEvent,
     Event,
     EventType,
+    KnowledgeRevisionCompletedEvent,
+    KnowledgeRevisionStartedEvent,
     LearningIterationCompletedEvent,
     LearningIterationStartedEvent,
     PlanProposedEvent,
@@ -20,15 +22,20 @@ from src.memory import (
     FinancialLedger,
     Heuristic,
     HeuristicStore,
+    KnowledgeLedger,
+    KnowledgeRevision,
     LearningIteration,
     LearningLedger,
     LedgerEntry,
+    LongTermKnowledge,
+    LongTermKnowledgeStore,
     MediumLearner,
     MemoryLedger,
     Outcome,
     OutcomeStore,
     PredictionLedger,
     PredictionRecord,
+    SlowLearner,
 )
 
 
@@ -885,6 +892,241 @@ class MemoryLedgerLearningSnapshotTests(unittest.TestCase):
         restored_heuristics = rebuilt_memory_ledger.heuristic_store.read_all()
         self.assertEqual(len(restored_heuristics), 2)
         self.assertEqual(restored_heuristics, memory_ledger.heuristic_store.read_all())
+
+
+class KnowledgeRevisionModelTests(unittest.TestCase):
+    def test_knowledge_revision_carries_required_fields(self) -> None:
+        record = KnowledgeRevision(
+            revision_id="revision-1",
+            status="started",
+            heuristics_considered=3,
+            started_at=datetime.now(timezone.utc),
+        )
+
+        self.assertEqual(record.revision_id, "revision-1")
+        self.assertEqual(record.status, "started")
+        self.assertEqual(record.heuristics_considered, 3)
+        self.assertIsNone(record.completed_at)
+        self.assertIsNone(record.consensus_confidence)
+        self.assertIsNone(record.knowledge_id)
+
+    def test_knowledge_revision_is_immutable(self) -> None:
+        record = KnowledgeRevision(
+            revision_id="revision-1",
+            status="started",
+            heuristics_considered=3,
+            started_at=datetime.now(timezone.utc),
+        )
+
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            record.status = "completed"  # type: ignore[misc]
+
+
+class KnowledgeLedgerTests(unittest.TestCase):
+    def test_append_read_all_and_history_for(self) -> None:
+        ledger = KnowledgeLedger()
+        started = KnowledgeRevision(
+            revision_id="revision-1", status="started", heuristics_considered=3,
+            started_at=datetime.now(timezone.utc),
+        )
+        completed = KnowledgeRevision(
+            revision_id="revision-1", status="completed", heuristics_considered=3,
+            started_at=started.started_at, completed_at=datetime.now(timezone.utc),
+            consensus_confidence=0.5, knowledge_id="knowledge-1",
+        )
+
+        ledger.append(started)
+        ledger.append(completed)
+
+        self.assertEqual(ledger.read_all(), [started, completed])
+        self.assertEqual(ledger.history_for("revision-1"), [started, completed])
+        self.assertEqual(ledger.history_for("no-such-revision"), [])
+
+    def test_ledger_has_no_mutation_methods_other_than_append(self) -> None:
+        ledger = KnowledgeLedger()
+
+        self.assertFalse(hasattr(ledger, "update"))
+        self.assertFalse(hasattr(ledger, "remove"))
+        self.assertFalse(hasattr(ledger, "clear"))
+
+
+def _heuristic(*, confidence: float, heuristic_id: str = "heuristic-1") -> Heuristic:
+    return Heuristic(
+        heuristic_id=heuristic_id,
+        description="calibration: mean prediction error 0.000000 over 1 resolved predictions",
+        confidence=confidence,
+        created_at=datetime.now(timezone.utc),
+    )
+
+
+class SlowLearnerTests(unittest.TestCase):
+    def test_should_consolidate_only_on_interval_boundaries(self) -> None:
+        learner = SlowLearner()
+
+        self.assertFalse(learner.should_consolidate(0))
+        self.assertFalse(learner.should_consolidate(1))
+        self.assertFalse(learner.should_consolidate(2))
+        self.assertTrue(learner.should_consolidate(3))
+        self.assertFalse(learner.should_consolidate(4))
+        self.assertTrue(learner.should_consolidate(6))
+
+    def test_compute_consensus_confidence_over_heuristics(self) -> None:
+        learner = SlowLearner()
+        heuristics = [
+            _heuristic(confidence=0.2, heuristic_id="heuristic-1"),
+            _heuristic(confidence=0.4, heuristic_id="heuristic-2"),
+        ]
+
+        self.assertAlmostEqual(learner.compute_consensus_confidence(heuristics), 0.3)
+
+    def test_compute_consensus_confidence_with_no_heuristics_is_zero(self) -> None:
+        learner = SlowLearner()
+
+        self.assertEqual(learner.compute_consensus_confidence([]), 0.0)
+
+    def test_compute_consensus_confidence_is_deterministic_for_identical_history(self) -> None:
+        learner = SlowLearner()
+        history_a = [_heuristic(confidence=0.2, heuristic_id="a"), _heuristic(confidence=0.6, heuristic_id="b")]
+        history_b = [_heuristic(confidence=0.2, heuristic_id="a"), _heuristic(confidence=0.6, heuristic_id="b")]
+
+        self.assertEqual(
+            learner.compute_consensus_confidence(history_a), learner.compute_consensus_confidence(history_b)
+        )
+
+    def test_describe_is_deterministic(self) -> None:
+        learner = SlowLearner()
+
+        first = learner.describe(consensus_confidence=0.42, heuristics_considered=3)
+        second = learner.describe(consensus_confidence=0.42, heuristics_considered=3)
+
+        self.assertEqual(first, second)
+        self.assertIn("3", first)
+
+
+class MemoryLedgerSlowLearningIntegrationTests(unittest.TestCase):
+    def _run_cycles(self, kernel: Kernel, count: int) -> None:
+        for i in range(count):
+            publish_plan_proposed(kernel, plan_id=f"plan-{i}", expected_value=60.0)
+            publish_action_succeeded(kernel, action_id=f"action-{i}", plan_id=f"plan-{i}")
+
+    def test_consolidation_triggers_after_interval_completed_medium_learning_iterations(self) -> None:
+        kernel = Kernel()
+        memory_ledger = MemoryLedger(kernel)
+
+        started: list[Event] = []
+        completed: list[Event] = []
+        kernel.register_subscriber(EventType.KNOWLEDGE_REVISION_STARTED, started.append)
+        kernel.register_subscriber(EventType.KNOWLEDGE_REVISION_COMPLETED, completed.append)
+
+        self._run_cycles(kernel, SlowLearner.CONSOLIDATION_INTERVAL)
+
+        self.assertEqual(len(started), 1)
+        self.assertIsInstance(started[0], KnowledgeRevisionStartedEvent)
+        self.assertEqual(started[0].heuristics_considered, SlowLearner.CONSOLIDATION_INTERVAL)
+
+        self.assertEqual(len(completed), 1)
+        self.assertIsInstance(completed[0], KnowledgeRevisionCompletedEvent)
+        self.assertEqual(completed[0].revision_id, started[0].revision_id)
+
+        history = memory_ledger.knowledge_ledger.history_for(started[0].revision_id)
+        self.assertEqual([record.status for record in history], ["started", "completed"])
+
+        knowledge = memory_ledger.long_term_knowledge_store.read_all()
+        self.assertEqual(len(knowledge), 1)
+        self.assertEqual(knowledge[0].knowledge_id, completed[0].knowledge_id)
+
+    def test_revisions_are_append_only_and_multiple_revisions_preserve_history(self) -> None:
+        kernel = Kernel()
+        memory_ledger = MemoryLedger(kernel)
+
+        self._run_cycles(kernel, SlowLearner.CONSOLIDATION_INTERVAL * 2)
+
+        records = memory_ledger.knowledge_ledger.read_all()
+        self.assertEqual(len(records), 4)  # started+completed, twice
+        revision_ids = {record.revision_id for record in records}
+        self.assertEqual(len(revision_ids), 2)
+
+        for revision_id in revision_ids:
+            history = memory_ledger.knowledge_ledger.history_for(revision_id)
+            self.assertEqual([record.status for record in history], ["started", "completed"])
+
+        knowledge = memory_ledger.long_term_knowledge_store.read_all()
+        self.assertEqual(len(knowledge), 2)
+
+    def test_identical_heuristic_histories_produce_identical_knowledge_revisions(self) -> None:
+        def run_cycle() -> MemoryLedger:
+            kernel = Kernel()
+            memory_ledger = MemoryLedger(kernel)
+            self._run_cycles(kernel, SlowLearner.CONSOLIDATION_INTERVAL)
+            return memory_ledger
+
+        first = run_cycle()
+        second = run_cycle()
+
+        first_knowledge = first.long_term_knowledge_store.read_all()
+        second_knowledge = second.long_term_knowledge_store.read_all()
+        self.assertEqual(len(first_knowledge), len(second_knowledge))
+        for a, b in zip(first_knowledge, second_knowledge):
+            self.assertEqual(a.summary, b.summary)
+            self.assertEqual(a.consensus_confidence, b.consensus_confidence)
+
+        first_confidences = [
+            record.consensus_confidence
+            for record in first.knowledge_ledger.read_all()
+            if record.status == "completed"
+        ]
+        second_confidences = [
+            record.consensus_confidence
+            for record in second.knowledge_ledger.read_all()
+            if record.status == "completed"
+        ]
+        self.assertEqual(first_confidences, second_confidences)
+
+
+class MemoryLedgerSlowLearningReplayTests(unittest.TestCase):
+    def test_replay_reconstructs_long_term_knowledge(self) -> None:
+        event_log = EventLog()
+        kernel = Kernel(event_log=event_log)
+        memory_ledger = MemoryLedger(kernel)
+
+        for i in range(SlowLearner.CONSOLIDATION_INTERVAL):
+            publish_plan_proposed(kernel, plan_id=f"plan-{i}", expected_value=60.0)
+            publish_action_succeeded(kernel, action_id=f"action-{i}", plan_id=f"plan-{i}")
+
+        rebuilt_kernel = Kernel(event_log=event_log)
+        rebuilt_memory_ledger = MemoryLedger(rebuilt_kernel)
+        rebuilt_kernel.replay()
+
+        self.assertEqual(
+            rebuilt_memory_ledger.knowledge_ledger.read_all(), memory_ledger.knowledge_ledger.read_all()
+        )
+        self.assertEqual(
+            rebuilt_memory_ledger.long_term_knowledge_store.read_all(),
+            memory_ledger.long_term_knowledge_store.read_all(),
+        )
+
+
+class MemoryLedgerSlowLearningSnapshotTests(unittest.TestCase):
+    def test_snapshot_restore_reconstructs_long_term_knowledge(self) -> None:
+        kernel = Kernel()
+        memory_ledger = MemoryLedger(kernel)
+
+        for i in range(SlowLearner.CONSOLIDATION_INTERVAL):
+            publish_plan_proposed(kernel, plan_id=f"plan-{i}", expected_value=60.0)
+            publish_action_succeeded(kernel, action_id=f"action-{i}", plan_id=f"plan-{i}")
+        kernel.create_snapshot()
+
+        rebuilt_kernel = Kernel(event_log=kernel.event_log, snapshot_store=kernel.snapshot_store)
+        rebuilt_memory_ledger = MemoryLedger(rebuilt_kernel)
+        rebuilt_kernel.replay()
+
+        restored_knowledge_revisions = rebuilt_memory_ledger.knowledge_ledger.read_all()
+        self.assertEqual(len(restored_knowledge_revisions), 2)
+        self.assertEqual(restored_knowledge_revisions, memory_ledger.knowledge_ledger.read_all())
+
+        restored_knowledge = rebuilt_memory_ledger.long_term_knowledge_store.read_all()
+        self.assertEqual(len(restored_knowledge), 1)
+        self.assertEqual(restored_knowledge, memory_ledger.long_term_knowledge_store.read_all())
 
 
 if __name__ == "__main__":
