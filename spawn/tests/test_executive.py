@@ -919,6 +919,109 @@ class ExecutiveOpportunityAggregationTests(unittest.TestCase):
         self.assertEqual(forward.confidence, backward.confidence)
         self.assertEqual(forward.expected_value, backward.expected_value)
 
+    def test_a_shared_correlation_id_alone_does_not_relate_unrelated_beliefs(self) -> None:
+        # World Model's apply_decay() sweeps every belief in one call, publishing
+        # a BeliefUpdatedEvent per belief with no drain in between; once the
+        # Kernel is started those all share one active correlation_id purely as
+        # an artifact of being dispatched in the same batch. Two genuinely
+        # unrelated beliefs (different claims) must not be folded into one
+        # opportunity just because that batch-sweep coincidence put them under
+        # the same correlation_id.
+        kernel = Kernel()
+        executive = Executive(kernel)
+        kernel.start()
+        kernel.publish(
+            BeliefCreatedEvent(
+                source_component="world_model",
+                belief_id="sensor:1",
+                claim="5.2",
+                confidence=0.5,
+                provenance="s1",
+                correlation_id=uuid4(),
+            )
+        )
+        kernel.run_until_idle()
+        kernel.publish(
+            BeliefCreatedEvent(
+                source_component="world_model",
+                belief_id="sensor:2",
+                claim="9.9",
+                confidence=0.5,
+                provenance="s2",
+                correlation_id=uuid4(),
+            )
+        )
+        kernel.run_until_idle()
+        baseline_opportunity_count = len(executive.opportunity_store.read_all())
+
+        decay_correlation_id = uuid4()
+        kernel.publish(
+            BeliefUpdatedEvent(
+                source_component="world_model",
+                belief_id="sensor:1",
+                previous_confidence=0.5,
+                new_confidence=0.49,
+                provenance="s1",
+                correlation_id=decay_correlation_id,
+            )
+        )
+        kernel.publish(
+            BeliefUpdatedEvent(
+                source_component="world_model",
+                belief_id="sensor:2",
+                previous_confidence=0.5,
+                new_confidence=0.48,
+                provenance="s2",
+                correlation_id=decay_correlation_id,
+            )
+        )
+        kernel.run_until_idle()
+
+        new_opportunities = executive.opportunity_store.read_all()[baseline_opportunity_count:]
+        self.assertEqual(len(new_opportunities), 2)
+        self.assertEqual({o.belief_ids for o in new_opportunities}, {("sensor:1",), ("sensor:2",)})
+
+    def test_a_belief_re_signatured_twice_within_one_batch_does_not_crash(self) -> None:
+        # If the same belief_id is re-signatured twice before either pending
+        # generation pass is processed, the first pass's signature is left
+        # with zero members (they all moved to the second signature) by the
+        # time it runs — aggregate_confidence must handle that gracefully
+        # instead of dividing by zero over an empty belief cluster.
+        kernel = Kernel()
+        executive = Executive(kernel)
+        kernel.start()
+
+        kernel.publish(
+            BeliefUpdatedEvent(
+                source_component="world_model",
+                belief_id="a",
+                previous_confidence=0.4,
+                new_confidence=0.4,
+                provenance="sensor",
+                correlation_id=uuid4(),
+            )
+        )
+        kernel.publish(
+            BeliefUpdatedEvent(
+                source_component="world_model",
+                belief_id="a",
+                previous_confidence=0.4,
+                new_confidence=0.6,
+                provenance="sensor",
+                correlation_id=uuid4(),
+            )
+        )
+
+        kernel.run_until_idle()
+
+        stale = [
+            record
+            for record in executive.opportunity_generation_ledger.read_all()
+            if record.status == "completed" and record.reason.startswith("stale")
+        ]
+        self.assertEqual(len(stale), 1)
+        self.assertEqual(len(executive.opportunity_store.read_all()), 1)
+
     def test_unrelated_beliefs_produce_separate_opportunities(self) -> None:
         kernel = Kernel()
         executive = Executive(kernel)

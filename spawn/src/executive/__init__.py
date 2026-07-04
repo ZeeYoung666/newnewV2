@@ -514,6 +514,24 @@ class Executive:
             )
         )
 
+        if not belief_ids:
+            # Every belief that was under this signature moved to a different
+            # one before this pass was reached (e.g. the same belief_id
+            # re-signatured twice within one undrained batch) — nothing is
+            # left to aggregate, so this pass is stale rather than a decision.
+            self._kernel.publish(
+                OpportunityGenerationCompletedEvent(
+                    source_component="executive",
+                    generation_id=event.generation_id,
+                    signature=event.signature,
+                    belief_ids=belief_ids,
+                    accepted=False,
+                    aggregated_confidence=0.0,
+                    reason="stale: no beliefs remain under this signature",
+                )
+            )
+            return
+
         aggregated_confidence = self._opportunity_generator.aggregate_confidence(
             [self._belief_confidence[belief_id] for belief_id in belief_ids]
         )
