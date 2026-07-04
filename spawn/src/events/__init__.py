@@ -16,6 +16,8 @@ class EventType(str, Enum):
     BELIEF_UPDATED = "belief.updated"
     OPPORTUNITY_IDENTIFIED = "opportunity.identified"
     OPPORTUNITY_SCORED = "opportunity.scored"
+    OPPORTUNITY_GENERATION_STARTED = "opportunity.generation_started"
+    OPPORTUNITY_GENERATION_COMPLETED = "opportunity.generation_completed"
     PLAN_PROPOSED = "plan.proposed"
     PLAN_ABANDONED = "plan.abandoned"
     PLAN_SELECTED = "plan.selected"
@@ -110,6 +112,31 @@ class OpportunityScoredEvent(Event):
     expected_value: float
     confidence: float
     event_type: EventType = EventType.OPPORTUNITY_SCORED
+
+
+@dataclass(slots=True, kw_only=True)
+class OpportunityGenerationStartedEvent(Event):
+    """Represents the Executive beginning an opportunity-generation pass for a signature."""
+
+    generation_id: str
+    signature: str
+    triggering_belief_id: str
+    event_type: EventType = EventType.OPPORTUNITY_GENERATION_STARTED
+
+
+@dataclass(slots=True, kw_only=True)
+class OpportunityGenerationCompletedEvent(Event):
+    """Represents an opportunity-generation pass finishing with an aggregation and novelty decision."""
+
+    generation_id: str
+    signature: str
+    belief_ids: tuple[str, ...]
+    accepted: bool
+    aggregated_confidence: float
+    reason: str
+    group_id: Optional[str] = None
+    opportunity_id: Optional[str] = None
+    event_type: EventType = EventType.OPPORTUNITY_GENERATION_COMPLETED
 
 
 @dataclass(slots=True, kw_only=True)
@@ -541,6 +568,8 @@ __all__ = [
     "BeliefUpdatedEvent",
     "OpportunityIdentifiedEvent",
     "OpportunityScoredEvent",
+    "OpportunityGenerationStartedEvent",
+    "OpportunityGenerationCompletedEvent",
     "PlanProposedEvent",
     "PlanAbandonedEvent",
     "ExecutiveDecisionEvent",

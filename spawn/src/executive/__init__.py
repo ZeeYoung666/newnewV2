@@ -13,15 +13,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from src.events import (
     BeliefCreatedEvent,
     BeliefUpdatedEvent,
     EventType,
     ExecutiveDecisionEvent,
+    OpportunityGenerationCompletedEvent,
+    OpportunityGenerationStartedEvent,
     OpportunityIdentifiedEvent,
     OpportunityScoredEvent,
+    OutcomeRecordedEvent,
     PlanAbandonedEvent,
     PlanProposedEvent,
 )
@@ -126,6 +129,58 @@ class _Candidate:
     capital_demand: float
 
 
+@dataclass(slots=True, kw_only=True, frozen=True)
+class OpportunityGroup:
+    """An immutable record of the belief cluster aggregated into one opportunity.
+
+    Append-only: a signature that gains further corroborating beliefs appends
+    a NEW record under the same group_id rather than mutating the prior one,
+    so replay never needs to recompute what aggregation already decided.
+    """
+
+    group_id: str
+    signature: str
+    belief_ids: tuple[str, ...]
+    aggregated_confidence: float
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass(slots=True, kw_only=True, frozen=True)
+class OpportunityGenerationRecord:
+    """An immutable audit trail entry for one opportunity-generation pass transition.
+
+    One record is appended per transition (started, then completed) — never
+    mutated — mirroring LearningIteration/KnowledgeRevision's shape-evolution
+    pattern, so the full history survives in OpportunityGenerationLedger even
+    though `status` only ever describes that single transition.
+    """
+
+    generation_id: str
+    status: str
+    signature: str
+    belief_ids: tuple[str, ...]
+    started_at: datetime
+    completed_at: Optional[datetime] = None
+    accepted: Optional[bool] = None
+    reason: Optional[str] = None
+    group_id: Optional[str] = None
+    opportunity_id: Optional[str] = None
+
+
+@dataclass(slots=True, kw_only=True, frozen=True)
+class ResolvedSituation:
+    """An immutable record marking a signature as resolved via Memory's episodic history.
+
+    Persists the novelty index across a snapshot boundary: without this, a
+    signature resolved before the latest snapshot would be forgotten on
+    restore (only events after the snapshot are replayed) and could be
+    re-proposed as novel.
+    """
+
+    signature: str
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 class GoalStore:
     """Append-only store of goals, keyed by goal_id."""
 
@@ -198,6 +253,94 @@ class DecisionRecordStore:
         return list(self._records)
 
 
+class OpportunityGroupStore:
+    """Append-only store of opportunity groups.
+
+    A signature can appear more than once (initial acceptance, then further
+    corroboration) — read_all() returns every version ever recorded, in order.
+    """
+
+    def __init__(self) -> None:
+        self._groups: list[OpportunityGroup] = []
+
+    def append(self, group: OpportunityGroup) -> None:
+        self._groups.append(group)
+
+    def read_all(self) -> list[OpportunityGroup]:
+        return list(self._groups)
+
+
+class OpportunityGenerationLedger:
+    """Append-only log of opportunity-generation pass transitions.
+
+    A generation_id can appear more than once (started, then completed) —
+    read_all() returns every transition ever recorded, in order.
+    """
+
+    def __init__(self) -> None:
+        self._records: list[OpportunityGenerationRecord] = []
+
+    def append(self, record: OpportunityGenerationRecord) -> None:
+        self._records.append(record)
+
+    def read_all(self) -> list[OpportunityGenerationRecord]:
+        return list(self._records)
+
+    def history_for(self, generation_id: str) -> list[OpportunityGenerationRecord]:
+        """All transitions recorded for a single generation pass, in order."""
+        return [record for record in self._records if record.generation_id == generation_id]
+
+
+class ResolvedSituationStore:
+    """Append-only store of signatures resolved via Memory's episodic history."""
+
+    def __init__(self) -> None:
+        self._entries: list[ResolvedSituation] = []
+
+    def append(self, entry: ResolvedSituation) -> None:
+        self._entries.append(entry)
+
+    def read_all(self) -> list[ResolvedSituation]:
+        return list(self._entries)
+
+
+class OpportunityGenerator:
+    """Deterministic, stateless computation for aggregating related beliefs and
+    suppressing non-novel or duplicate situations.
+
+    Owns no store of its own — Executive owns OpportunityGenerationLedger and
+    OpportunityGroupStore. Given the same belief cluster and the same seen-
+    signature history, this always returns the same decision, which is what
+    makes replay and repeated runs over identical history produce identical
+    opportunities regardless of the order related beliefs originally arrived
+    in.
+    """
+
+    def aggregate_confidence(self, confidences: list[float]) -> float:
+        """The mean confidence across every belief in the aggregated group."""
+        return round(sum(confidences) / len(confidences), 6)
+
+    def decide(
+        self,
+        *,
+        belief_ids: tuple[str, ...],
+        previously_generated_belief_ids: Optional[tuple[str, ...]],
+        already_resolved: bool,
+    ) -> tuple[bool, str]:
+        """Decide whether this belief cluster is novel enough to propose.
+
+        Rejects an identical belief cluster already generated for this
+        signature (duplicate situation, still in flight), and separately
+        rejects a signature Memory's episodic history already shows was
+        resolved (not novel), even if the cluster itself just grew.
+        """
+        if belief_ids == previously_generated_belief_ids:
+            return False, "duplicate: identical belief cluster already generated"
+        if already_resolved:
+            return False, "not novel: situation already resolved in episodic memory"
+        return True, "novel aggregated situation"
+
+
 class Executive:
     """Reacts to belief events by proposing opportunities and plans. Proposes only."""
 
@@ -208,12 +351,34 @@ class Executive:
         self.opportunity_store = OpportunityStore()
         self.plan_store = PlanStore()
         self.decision_record_store = DecisionRecordStore()
+        self.opportunity_group_store = OpportunityGroupStore()
+        self.opportunity_generation_ledger = OpportunityGenerationLedger()
+        self.resolved_situation_store = ResolvedSituationStore()
+        self._opportunity_generator = OpportunityGenerator()
         # Plans proposed but not yet decided, oldest first. Deliberation
         # ranks and clears these; the list order is the deterministic FIFO
         # tie-break among equally valued candidates.
         self._pending_plan_ids: list[str] = []
+        # Executive's own read model of belief signals, built purely from the
+        # events it already subscribes to (never reads World Model's store).
+        self._belief_confidence: dict[str, float] = {}
+        self._belief_claim: dict[str, str] = {}
+        self._signature_for_belief: dict[str, str] = {}
+        self._belief_ids_by_signature: dict[str, set[str]] = {}
+        # Bookkeeping for aggregation and duplicate/novelty suppression.
+        self._group_id_by_signature: dict[str, str] = {}
+        self._last_generated_belief_ids: dict[str, tuple[str, ...]] = {}
+        self._opportunity_signature: dict[str, str] = {}
+        # Novelty index derived solely from Memory's OUTCOME_RECORDED events —
+        # the sanctioned, event-based path into Memory's episodic history.
+        self._resolved_signatures: set[str] = set()
         kernel.register_subscriber(EventType.BELIEF_CREATED, self._on_belief_created)
         kernel.register_subscriber(EventType.BELIEF_UPDATED, self._on_belief_updated)
+        kernel.register_subscriber(EventType.OPPORTUNITY_GENERATION_STARTED, self._on_opportunity_generation_started)
+        kernel.register_subscriber(
+            EventType.OPPORTUNITY_GENERATION_COMPLETED, self._on_opportunity_generation_completed
+        )
+        kernel.register_subscriber(EventType.OUTCOME_RECORDED, self._on_outcome_recorded)
         # Decision records for committed and abandoned plans are appended in
         # response to the emitted events, not inside deliberate() itself, so a
         # full replay of the log reconstructs them exactly as a live run did.
@@ -229,6 +394,24 @@ class Executive:
             self.decision_record_store.read_all,
             self._restore_decision_records,
         )
+        kernel.register_snapshot_source(
+            "executive.opportunity_groups",
+            OpportunityGroup,
+            self.opportunity_group_store.read_all,
+            self._restore_opportunity_groups,
+        )
+        kernel.register_snapshot_source(
+            "executive.opportunity_generation_records",
+            OpportunityGenerationRecord,
+            self.opportunity_generation_ledger.read_all,
+            self._restore_opportunity_generation_records,
+        )
+        kernel.register_snapshot_source(
+            "executive.resolved_situations",
+            ResolvedSituation,
+            self.resolved_situation_store.read_all,
+            self._restore_resolved_situations,
+        )
 
     def _restore_opportunities(self, opportunities: list[Opportunity]) -> None:
         for opportunity in opportunities:
@@ -242,21 +425,188 @@ class Executive:
         for record in records:
             self.decision_record_store.append(record)
 
+    def _restore_opportunity_groups(self, groups: list[OpportunityGroup]) -> None:
+        for group in groups:
+            self.opportunity_group_store.append(group)
+            self._group_id_by_signature[group.signature] = group.group_id
+            self._last_generated_belief_ids[group.signature] = group.belief_ids
+            # signature is always "{correlation_id}:{claim_key}" (correlation_id
+            # is a UUID's str(), which never contains ':'); recovering claim_key
+            # here is what lets a belief event arriving after restore compute
+            # the SAME signature its earlier sibling did, instead of falling
+            # back to belief_id and silently opening a new, mismatched cluster.
+            _, claim_key = group.signature.split(":", 1)
+            for belief_id in group.belief_ids:
+                self._belief_ids_by_signature.setdefault(group.signature, set()).add(belief_id)
+                self._signature_for_belief[belief_id] = group.signature
+                self._belief_claim.setdefault(belief_id, claim_key)
+                # Per-member confidence isn't preserved by the group snapshot;
+                # seed it with the group's aggregate so a signature reopened
+                # after restore has a value to aggregate from until the next
+                # belief event for that member overwrites it with the real one.
+                self._belief_confidence.setdefault(belief_id, group.aggregated_confidence)
+
+    def _restore_opportunity_generation_records(self, records: list[OpportunityGenerationRecord]) -> None:
+        for record in records:
+            self.opportunity_generation_ledger.append(record)
+            if record.status == "completed" and record.accepted and record.opportunity_id is not None:
+                self._opportunity_signature[record.opportunity_id] = record.signature
+
+    def _restore_resolved_situations(self, entries: list[ResolvedSituation]) -> None:
+        for entry in entries:
+            self.resolved_situation_store.append(entry)
+            self._resolved_signatures.add(entry.signature)
+
     def _on_belief_created(self, event: BeliefCreatedEvent) -> None:
-        self._process_belief(belief_id=event.belief_id, confidence=event.confidence)
+        self._belief_claim[event.belief_id] = event.claim
+        self._register_belief_signal(
+            belief_id=event.belief_id, confidence=event.confidence, correlation_id=event.correlation_id
+        )
 
     def _on_belief_updated(self, event: BeliefUpdatedEvent) -> None:
-        self._process_belief(belief_id=event.belief_id, confidence=event.new_confidence)
+        # BeliefUpdatedEvent carries no claim, so the cached claim from this
+        # belief's own BeliefCreatedEvent (World Model never changes a
+        # belief's claim on a decay tick) is reused; an update with no prior
+        # cached claim falls back to the belief_id itself.
+        self._register_belief_signal(
+            belief_id=event.belief_id, confidence=event.new_confidence, correlation_id=event.correlation_id
+        )
 
-    def _process_belief(self, *, belief_id: str, confidence: float) -> None:
-        opportunity = self._identify_opportunity(belief_id=belief_id, confidence=confidence)
+    def _register_belief_signal(self, *, belief_id: str, confidence: float, correlation_id: Optional[UUID]) -> None:
+        """Record one belief signal and trigger an opportunity-generation pass.
+
+        Beliefs are related when they share both a correlation_id (the same
+        causal cascade) AND a claim (the same asserted situation) — a
+        correlation_id alone is not enough: a batch of otherwise-unrelated
+        beliefs updated back-to-back within one dispatch (e.g. World Model's
+        apply_decay sweeping every belief in one call) shares one active
+        correlation_id without being about the same situation. The actual
+        accept/aggregate decision is made in `_on_opportunity_generation_started`,
+        not here, so a sibling belief already queued for the same cascade is
+        folded into the same pass regardless of which one arrives first.
+        """
+        claim_key = self._belief_claim.get(belief_id, belief_id)
+        signature = f"{correlation_id}:{claim_key}"
+        self._belief_confidence[belief_id] = confidence
+        previous_signature = self._signature_for_belief.get(belief_id)
+        if previous_signature is not None and previous_signature != signature:
+            self._belief_ids_by_signature.get(previous_signature, set()).discard(belief_id)
+        self._signature_for_belief[belief_id] = signature
+        self._belief_ids_by_signature.setdefault(signature, set()).add(belief_id)
+        self._kernel.publish(
+            OpportunityGenerationStartedEvent(
+                source_component="executive",
+                generation_id=str(uuid4()),
+                signature=signature,
+                triggering_belief_id=belief_id,
+            )
+        )
+
+    def _on_opportunity_generation_started(self, event: OpportunityGenerationStartedEvent) -> None:
+        belief_ids = tuple(sorted(self._belief_ids_by_signature.get(event.signature, set())))
+        self.opportunity_generation_ledger.append(
+            OpportunityGenerationRecord(
+                generation_id=event.generation_id,
+                status="started",
+                signature=event.signature,
+                belief_ids=belief_ids,
+                started_at=event.timestamp,
+            )
+        )
+
+        aggregated_confidence = self._opportunity_generator.aggregate_confidence(
+            [self._belief_confidence[belief_id] for belief_id in belief_ids]
+        )
+        accepted, reason = self._opportunity_generator.decide(
+            belief_ids=belief_ids,
+            previously_generated_belief_ids=self._last_generated_belief_ids.get(event.signature),
+            already_resolved=event.signature in self._resolved_signatures,
+        )
+
+        group_id: Optional[str] = None
+        opportunity_id: Optional[str] = None
+        if accepted:
+            group_id = self._group_id_by_signature.get(event.signature) or str(uuid4())
+            opportunity_id = str(uuid4())
+            # Recorded immediately — not deferred to the Completed handler —
+            # so a sibling generation pass for the same signature, already
+            # queued right behind this one, sees this decision and is
+            # correctly treated as a duplicate rather than racing to accept
+            # the identical cluster a second time.
+            self._group_id_by_signature[event.signature] = group_id
+            self._last_generated_belief_ids[event.signature] = belief_ids
+
+        self._kernel.publish(
+            OpportunityGenerationCompletedEvent(
+                source_component="executive",
+                generation_id=event.generation_id,
+                signature=event.signature,
+                belief_ids=belief_ids,
+                accepted=accepted,
+                aggregated_confidence=aggregated_confidence,
+                reason=reason,
+                group_id=group_id,
+                opportunity_id=opportunity_id,
+            )
+        )
+
+    def _on_opportunity_generation_completed(self, event: OpportunityGenerationCompletedEvent) -> None:
+        started_record = self.opportunity_generation_ledger.history_for(event.generation_id)[0]
+        self.opportunity_generation_ledger.append(
+            OpportunityGenerationRecord(
+                generation_id=event.generation_id,
+                status="completed",
+                signature=event.signature,
+                belief_ids=event.belief_ids,
+                started_at=started_record.started_at,
+                completed_at=event.timestamp,
+                accepted=event.accepted,
+                reason=event.reason,
+                group_id=event.group_id,
+                opportunity_id=event.opportunity_id,
+            )
+        )
+        if not event.accepted:
+            return
+
+        assert event.group_id is not None and event.opportunity_id is not None
+        self.opportunity_group_store.append(
+            OpportunityGroup(
+                group_id=event.group_id,
+                signature=event.signature,
+                belief_ids=event.belief_ids,
+                aggregated_confidence=event.aggregated_confidence,
+            )
+        )
+        self._opportunity_signature[event.opportunity_id] = event.signature
+
+        opportunity = self._identify_opportunity(
+            opportunity_id=event.opportunity_id, belief_ids=event.belief_ids, confidence=event.aggregated_confidence
+        )
         self._score_opportunity(opportunity)
         self._propose_plan(opportunity)
 
-    def _identify_opportunity(self, *, belief_id: str, confidence: float) -> Opportunity:
+    def _on_outcome_recorded(self, event: OutcomeRecordedEvent) -> None:
+        """Fold Memory's episodic history into the novelty index.
+
+        The sole sanctioned path into Memory's episodic memory: Executive
+        never reads Memory's stores directly, it only ever learns that a
+        situation was resolved via this published event, resolved back to
+        the signature through Executive's own plan/opportunity records.
+        """
+        try:
+            plan = self.plan_store.get(event.plan_id)
+        except KeyError:
+            return
+        signature = self._opportunity_signature.get(plan.opportunity_id)
+        if signature is not None and signature not in self._resolved_signatures:
+            self._resolved_signatures.add(signature)
+            self.resolved_situation_store.append(ResolvedSituation(signature=signature))
+
+    def _identify_opportunity(self, *, opportunity_id: str, belief_ids: tuple[str, ...], confidence: float) -> Opportunity:
         opportunity = Opportunity(
-            opportunity_id=str(uuid4()),
-            belief_ids=(belief_id,),
+            opportunity_id=opportunity_id,
+            belief_ids=belief_ids,
             expected_value=round(confidence * EXPECTED_VALUE_PER_CONFIDENCE, 4),
             confidence=confidence,
         )
@@ -274,7 +624,7 @@ class Executive:
                 decision_id=str(uuid4()),
                 decision_type="opportunity_identified",
                 subject_id=opportunity.opportunity_id,
-                rationale=f"belief {belief_id} observed with confidence {confidence}",
+                rationale=f"beliefs {belief_ids} aggregated with confidence {confidence}",
             )
         )
         return opportunity
@@ -542,6 +892,13 @@ __all__ = [
     "GoalStore",
     "Opportunity",
     "OpportunityStore",
+    "OpportunityGroup",
+    "OpportunityGroupStore",
+    "OpportunityGenerationRecord",
+    "OpportunityGenerationLedger",
+    "OpportunityGenerator",
+    "ResolvedSituation",
+    "ResolvedSituationStore",
     "Plan",
     "PlanStore",
     "DecisionRecord",

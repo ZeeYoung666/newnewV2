@@ -13,8 +13,11 @@ from src.events import (
     ExecutiveDecisionEvent,
     InferenceCompletedEvent,
     InferenceRequestedEvent,
+    OpportunityGenerationCompletedEvent,
+    OpportunityGenerationStartedEvent,
     OpportunityIdentifiedEvent,
     OpportunityScoredEvent,
+    OutcomeRecordedEvent,
     PlanAbandonedEvent,
     PlanProposedEvent,
 )
@@ -25,6 +28,11 @@ from src.executive import (
     Goal,
     GoalStore,
     Opportunity,
+    OpportunityGenerationLedger,
+    OpportunityGenerationRecord,
+    OpportunityGenerator,
+    OpportunityGroup,
+    OpportunityGroupStore,
     OpportunityStore,
     Plan,
     PlanStore,
@@ -736,6 +744,382 @@ class ExecutiveDeliberationReplayTests(unittest.TestCase):
         self._run_live()
 
         self.assertEqual(self._replay(), self._replay())
+
+
+class OpportunityGroupModelTests(unittest.TestCase):
+    def test_opportunity_group_carries_required_fields(self) -> None:
+        now = datetime.now(timezone.utc)
+        group = OpportunityGroup(
+            group_id="group-1",
+            signature="sig-1",
+            belief_ids=("belief-1", "belief-2"),
+            aggregated_confidence=0.65,
+            created_at=now,
+        )
+
+        self.assertEqual(group.group_id, "group-1")
+        self.assertEqual(group.signature, "sig-1")
+        self.assertEqual(group.belief_ids, ("belief-1", "belief-2"))
+        self.assertEqual(group.aggregated_confidence, 0.65)
+        self.assertEqual(group.created_at, now)
+
+    def test_opportunity_group_is_immutable(self) -> None:
+        group = OpportunityGroup(
+            group_id="group-1",
+            signature="sig-1",
+            belief_ids=("belief-1",),
+            aggregated_confidence=0.5,
+            created_at=datetime.now(timezone.utc),
+        )
+
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            group.aggregated_confidence = 0.9  # type: ignore[misc]
+
+
+class OpportunityGroupStoreTests(unittest.TestCase):
+    def test_append_and_read_all(self) -> None:
+        store = OpportunityGroupStore()
+        group = OpportunityGroup(
+            group_id="group-1", signature="sig-1", belief_ids=("belief-1",), aggregated_confidence=0.5
+        )
+
+        store.append(group)
+
+        self.assertEqual(store.read_all(), [group])
+
+
+class OpportunityGenerationLedgerTests(unittest.TestCase):
+    def test_append_read_all_and_history_for(self) -> None:
+        ledger = OpportunityGenerationLedger()
+        started = OpportunityGenerationRecord(
+            generation_id="gen-1",
+            status="started",
+            signature="sig-1",
+            belief_ids=("belief-1",),
+            started_at=datetime.now(timezone.utc),
+        )
+        completed = OpportunityGenerationRecord(
+            generation_id="gen-1",
+            status="completed",
+            signature="sig-1",
+            belief_ids=("belief-1",),
+            started_at=started.started_at,
+            completed_at=datetime.now(timezone.utc),
+            accepted=True,
+            reason="novel aggregated situation",
+            group_id="group-1",
+            opportunity_id="opportunity-1",
+        )
+
+        ledger.append(started)
+        ledger.append(completed)
+
+        self.assertEqual(ledger.read_all(), [started, completed])
+        self.assertEqual(ledger.history_for("gen-1"), [started, completed])
+        self.assertEqual(ledger.history_for("unknown"), [])
+
+
+class OpportunityGeneratorTests(unittest.TestCase):
+    """Unit tests for the stateless aggregation/novelty computation."""
+
+    def setUp(self) -> None:
+        self.generator = OpportunityGenerator()
+
+    def test_aggregate_confidence_is_the_mean(self) -> None:
+        self.assertEqual(self.generator.aggregate_confidence([0.4, 0.8]), 0.6)
+
+    def test_decide_accepts_a_brand_new_signature(self) -> None:
+        accepted, reason = self.generator.decide(
+            belief_ids=("a",), previously_generated_belief_ids=None, already_resolved=False
+        )
+
+        self.assertTrue(accepted)
+        self.assertIn("novel", reason)
+
+    def test_decide_rejects_an_identical_cluster_already_generated(self) -> None:
+        accepted, reason = self.generator.decide(
+            belief_ids=("a", "b"), previously_generated_belief_ids=("a", "b"), already_resolved=False
+        )
+
+        self.assertFalse(accepted)
+        self.assertIn("duplicate", reason)
+
+    def test_decide_accepts_a_grown_cluster_not_yet_resolved(self) -> None:
+        accepted, reason = self.generator.decide(
+            belief_ids=("a", "b"), previously_generated_belief_ids=("a",), already_resolved=False
+        )
+
+        self.assertTrue(accepted)
+
+    def test_decide_rejects_a_resolved_signature_even_if_the_cluster_grew(self) -> None:
+        accepted, reason = self.generator.decide(
+            belief_ids=("a", "b"), previously_generated_belief_ids=("a",), already_resolved=True
+        )
+
+        self.assertFalse(accepted)
+        self.assertIn("not novel", reason)
+
+
+def _publish_related_beliefs(
+    kernel: Kernel, signals: list[tuple[str, float]], correlation_id, claim: str = "shared-situation"
+) -> None:
+    """Queue several belief signals about the same claim, sharing one signature,
+    without draining between them, so a single run_until_idle() processes them
+    as one batch — exercising real aggregation rather than isolated
+    one-at-a-time pipelines. A signature is (correlation_id, claim): sharing
+    just a correlation_id is not enough (see the decay-sweep note on
+    `Executive._register_belief_signal`), so related beliefs must also agree
+    on the claim they corroborate.
+    """
+    for belief_id, confidence in signals:
+        kernel.publish(
+            BeliefCreatedEvent(
+                source_component="world_model",
+                belief_id=belief_id,
+                claim=claim,
+                confidence=confidence,
+                provenance="sensor",
+                correlation_id=correlation_id,
+            )
+        )
+
+
+class ExecutiveOpportunityAggregationTests(unittest.TestCase):
+    def test_multiple_related_beliefs_produce_a_single_aggregated_opportunity(self) -> None:
+        kernel = Kernel()
+        executive = Executive(kernel)
+        kernel.start()
+        correlation_id = uuid4()
+
+        _publish_related_beliefs(kernel, [("a", 0.4), ("b", 0.8)], correlation_id)
+        kernel.run_until_idle()
+
+        opportunities = executive.opportunity_store.read_all()
+        self.assertEqual(len(opportunities), 1)
+        self.assertEqual(opportunities[0].belief_ids, ("a", "b"))
+        self.assertAlmostEqual(opportunities[0].confidence, 0.6)
+        self.assertEqual(len(executive.plan_store.read_all()), 1)
+        self.assertEqual(executive.pending_plan_ids(), [executive.plan_store.read_all()[0].plan_id])
+
+    def test_aggregation_is_independent_of_arrival_order(self) -> None:
+        def run(order: list[tuple[str, float]]) -> Opportunity:
+            kernel = Kernel()
+            executive = Executive(kernel)
+            kernel.start()
+            _publish_related_beliefs(kernel, order, uuid4())
+            kernel.run_until_idle()
+            opportunities = executive.opportunity_store.read_all()
+            self.assertEqual(len(opportunities), 1)
+            return opportunities[0]
+
+        forward = run([("a", 0.4), ("b", 0.8)])
+        backward = run([("b", 0.8), ("a", 0.4)])
+
+        self.assertEqual(forward.belief_ids, backward.belief_ids)
+        self.assertEqual(forward.confidence, backward.confidence)
+        self.assertEqual(forward.expected_value, backward.expected_value)
+
+    def test_unrelated_beliefs_produce_separate_opportunities(self) -> None:
+        kernel = Kernel()
+        executive = Executive(kernel)
+        kernel.start()
+
+        _publish_related_beliefs(kernel, [("a", 0.4)], uuid4())
+        _publish_related_beliefs(kernel, [("b", 0.8)], uuid4())
+        kernel.run_until_idle()
+
+        opportunities = executive.opportunity_store.read_all()
+        self.assertEqual(len(opportunities), 2)
+        self.assertEqual({o.belief_ids for o in opportunities}, {("a",), ("b",)})
+
+    def test_duplicate_generation_for_an_identical_cluster_is_rejected(self) -> None:
+        kernel = Kernel()
+        executive = Executive(kernel)
+        correlation_id = uuid4()
+
+        kernel.publish(
+            BeliefCreatedEvent(
+                source_component="world_model",
+                belief_id="a",
+                claim="0.4",
+                confidence=0.4,
+                provenance="sensor",
+                correlation_id=correlation_id,
+            )
+        )
+        # Re-publishing the identical belief cluster under the same signature
+        # must not mint a second opportunity for the same situation.
+        kernel.publish(
+            BeliefUpdatedEvent(
+                source_component="world_model",
+                belief_id="a",
+                previous_confidence=0.4,
+                new_confidence=0.4,
+                provenance="sensor",
+                correlation_id=correlation_id,
+            )
+        )
+
+        self.assertEqual(len(executive.opportunity_store.read_all()), 1)
+        rejected = [
+            record
+            for record in executive.opportunity_generation_ledger.read_all()
+            if record.status == "completed" and not record.accepted
+        ]
+        self.assertEqual(len(rejected), 1)
+        self.assertIn("duplicate", rejected[0].reason)
+
+    def test_previously_seen_situations_are_rejected_by_novelty_detection(self) -> None:
+        kernel = Kernel()
+        executive = Executive(kernel)
+        correlation_id = uuid4()
+
+        kernel.publish(
+            BeliefCreatedEvent(
+                source_component="world_model",
+                belief_id="a",
+                claim="market-signal",
+                confidence=0.4,
+                provenance="sensor",
+                correlation_id=correlation_id,
+            )
+        )
+        plan_id = executive.plan_store.read_all()[0].plan_id
+
+        # Memory records an outcome for that plan — the sole sanctioned path
+        # through which Executive learns a situation was already resolved.
+        kernel.publish(
+            OutcomeRecordedEvent(
+                source_component="memory_ledger",
+                outcome_id=str(uuid4()),
+                action_id="action-1",
+                plan_id=plan_id,
+                success=True,
+                result="done",
+            )
+        )
+
+        # The same signature recurs with a new corroborating belief; without
+        # novelty detection this would be accepted as a grown cluster.
+        kernel.publish(
+            BeliefCreatedEvent(
+                source_component="world_model",
+                belief_id="c",
+                claim="market-signal",
+                confidence=0.7,
+                provenance="sensor",
+                correlation_id=correlation_id,
+            )
+        )
+
+        self.assertEqual(len(executive.opportunity_store.read_all()), 1)
+        rejected = [
+            record
+            for record in executive.opportunity_generation_ledger.read_all()
+            if record.status == "completed" and not record.accepted
+        ]
+        self.assertEqual(len(rejected), 1)
+        self.assertIn("not novel", rejected[0].reason)
+
+
+class OpportunityGenerationReplayTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        self.log_path = Path(tmpdir.name) / "events.jsonl"
+
+    def _run_live(self) -> Executive:
+        kernel = Kernel(event_log=EventLog(path=self.log_path))
+        executive = Executive(kernel)
+        kernel.start()
+        _publish_related_beliefs(kernel, [("a", 0.4), ("b", 0.8)], uuid4())
+        kernel.run_until_idle()
+        kernel.stop()
+        return executive
+
+    def _replay(self) -> Executive:
+        kernel = Kernel(event_log=EventLog(path=self.log_path))
+        executive = Executive(kernel)
+        kernel.replay()
+        return executive
+
+    def test_replay_reconstructs_opportunity_generation(self) -> None:
+        live = self._run_live()
+        replayed = self._replay()
+
+        self.assertEqual(
+            [g.belief_ids for g in replayed.opportunity_group_store.read_all()],
+            [g.belief_ids for g in live.opportunity_group_store.read_all()],
+        )
+        self.assertEqual(
+            [(r.status, r.accepted) for r in replayed.opportunity_generation_ledger.read_all()],
+            [(r.status, r.accepted) for r in live.opportunity_generation_ledger.read_all()],
+        )
+        self.assertEqual(len(replayed.opportunity_store.read_all()), 1)
+        self.assertEqual(replayed.opportunity_store.read_all()[0].belief_ids, ("a", "b"))
+
+    def test_replay_is_deterministic_across_restarts(self) -> None:
+        self._run_live()
+
+        first = self._replay()
+        second = self._replay()
+        self.assertEqual(
+            [g.belief_ids for g in first.opportunity_group_store.read_all()],
+            [g.belief_ids for g in second.opportunity_group_store.read_all()],
+        )
+
+
+class OpportunityGenerationSnapshotTests(unittest.TestCase):
+    def test_snapshot_restore_reconstructs_opportunity_generation_state(self) -> None:
+        kernel = Kernel()
+        executive = Executive(kernel)
+        correlation_id = uuid4()
+
+        kernel.publish(
+            BeliefCreatedEvent(
+                source_component="world_model",
+                belief_id="a",
+                claim="0.4",
+                confidence=0.4,
+                provenance="sensor",
+                correlation_id=correlation_id,
+            )
+        )
+        kernel.create_snapshot()
+
+        rebuilt_kernel = Kernel(event_log=kernel.event_log, snapshot_store=kernel.snapshot_store)
+        rebuilt_executive = Executive(rebuilt_kernel)
+        rebuilt_kernel.replay()
+
+        self.assertEqual(len(rebuilt_executive.opportunity_store.read_all()), 1)
+        restored_opportunity = rebuilt_executive.opportunity_store.read_all()[0]
+        self.assertEqual(restored_opportunity.belief_ids, ("a",))
+        self.assertEqual(
+            [g.belief_ids for g in rebuilt_executive.opportunity_group_store.read_all()],
+            [("a",)],
+        )
+
+        # Duplicate detection must survive the snapshot boundary: re-observing
+        # the identical belief cluster after restore is still rejected.
+        rebuilt_kernel.publish(
+            BeliefUpdatedEvent(
+                source_component="world_model",
+                belief_id="a",
+                previous_confidence=0.4,
+                new_confidence=0.4,
+                provenance="sensor",
+                correlation_id=correlation_id,
+            )
+        )
+
+        self.assertEqual(len(rebuilt_executive.opportunity_store.read_all()), 1)
+        rejected = [
+            record
+            for record in rebuilt_executive.opportunity_generation_ledger.read_all()
+            if record.status == "completed" and not record.accepted
+        ]
+        self.assertEqual(len(rejected), 1)
+        self.assertIn("duplicate", rejected[0].reason)
 
 
 if __name__ == "__main__":

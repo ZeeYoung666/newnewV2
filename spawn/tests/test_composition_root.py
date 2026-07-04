@@ -53,10 +53,13 @@ class BuildOrganismTests(unittest.TestCase):
         self.assertEqual(subscriber_counts.get(EventType.APPROVAL_GRANTED), 1)
         self.assertEqual(subscriber_counts.get(EventType.ACTION_SUCCEEDED), 1)
         self.assertEqual(subscriber_counts.get(EventType.ACTION_FAILED), 1)
+        # MemoryLedger (prediction resolution) and Executive (novelty index
+        # over episodic history) both react to a recorded outcome.
+        self.assertEqual(subscriber_counts.get(EventType.OUTCOME_RECORDED), 2)
 
         # No event type should ever have more than one subscriber in this wiring,
-        # except the deliberate fan-out above.
-        multi_subscriber_event_types = {EventType.PLAN_PROPOSED}
+        # except the deliberate fan-outs above.
+        multi_subscriber_event_types = {EventType.PLAN_PROPOSED, EventType.OUTCOME_RECORDED}
         for event_type, count in subscriber_counts.items():
             if event_type in multi_subscriber_event_types:
                 continue
@@ -121,6 +124,8 @@ class BootstrapCycleTests(unittest.TestCase):
             [
                 EventType.OBSERVATION_CREATED,
                 EventType.BELIEF_CREATED,
+                EventType.OPPORTUNITY_GENERATION_STARTED,
+                EventType.OPPORTUNITY_GENERATION_COMPLETED,
                 EventType.OPPORTUNITY_IDENTIFIED,
                 EventType.OPPORTUNITY_SCORED,
                 EventType.PLAN_PROPOSED,
@@ -156,7 +161,7 @@ class BootstrapCycleTests(unittest.TestCase):
         cascade = self.organism.kernel.event_log.read_from(start_sequence)
         correlation_ids = {event.correlation_id for _, event in cascade}
 
-        self.assertEqual(len(cascade), 26)
+        self.assertEqual(len(cascade), 28)
         self.assertEqual(len(correlation_ids), 1)
         self.assertIsNotNone(next(iter(correlation_ids)))
 
@@ -172,8 +177,8 @@ class BootstrapCycleTests(unittest.TestCase):
         first_ids = {event.correlation_id for event in first_cascade}
         second_ids = {event.correlation_id for event in second_cascade}
 
-        self.assertEqual(len(first_cascade), 26)
-        self.assertEqual(len(second_cascade), 26)
+        self.assertEqual(len(first_cascade), 28)
+        self.assertEqual(len(second_cascade), 28)
         self.assertEqual(len(first_ids), 1)
         self.assertEqual(len(second_ids), 1)
         self.assertNotEqual(first_ids, second_ids)

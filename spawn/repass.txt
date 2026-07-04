@@ -1,0 +1,257 @@
+7/2/26, 11:05 PM                                                      Architecture Compliance Audit -- Update
+
+ARCHITECTURE COMPLIANCE AUDIT · UPDATE PASS
+
+Two tasks landed. The organism
+boots and remembers itself.
+
+Re-comparison of spawn/ against Architecture.md, measured against the
+7/2 6:31pm audit. Covers Task #16 (Composition Root) and Task #17
+(Replay-on-Start) -- everything else in the codebase is unchanged since the
+last pass.
+
+BASELINE AUDIT 7/2/26 6:31 PM THIS PASS 7/2/26 10:40 PM
+
+READ-ONLY · NO CODE MODIFIED BY THIS AUDIT
+
+             OVERALL COMPLETION                                       TESTS PASSING                            COMPOSITION ROOT
+
+https://claude.ai/code/artifact/74c9aa17-71d3-4f85-ba98-b05c94efe68e                                                                                                                                     1/13
+7/2/26, 11:05 PM                                         Architecture Compliance Audit -- Update   wired
+
+     53%  59%                  134/134  177/177 not
+
+             COMPONENTS FULLY                                       wired
+             COMPLETE
+
+     2/8  2/8
+
+What shipped
+
+Both tasks were scoped as pure Kernel/composition work -- no component's
+internal logic (Perception, World Model, Executive, Governor, Executor,
+Memory & Ledger, Inference Port) changed. Their scores below are carried
+forward unchanged.
+
+          Task #16 -- Composition Root                                                            roadmap item 6
+
+https://claude.ai/code/artifact/74c9aa17-71d3-4f85-ba98-b05c94efe68e                                                                                          2/13
+7/2/26, 11:05 PM                                                                                                             Architecture Compliance Audit -- Update
+
+                   main.py now constructs exactly one Kernel and exactly one instance of all seven
+                  components against it, plus the Inference Port and its provider registry.
+                  Added a deterministic bootstrap path: one observation runs the full Observation 
+
+                  Belief  Opportunity  Plan  Approval  Execution  Outcome  Memory
+
+                  chain through typed events only -- no component called directly out of sequence.
+                  10 new integration tests assert single shared Kernel, exactly-once subscriptions, and
+                  the full 18-event cascade in architectural order.
+
+                  Task #17 -- Replay-on-Start                         roadmap item 3
+
+                   Kernel.replay() re-dispatches every persisted event through the same subscriber
+                  path live events use -- zero component-specific replay code.
+                   Kernel.start() now runs replay automatically, exactly once, before the first
+                   KERNEL_STARTING event -- replay is structurally guaranteed to finish before normal
+                  scheduling begins.
+                  Nested publish() calls are suppressed during replay, so re-running old handlers
+                  reconstructs state without appending a single duplicate event to the log.
+
+https://claude.ai/code/artifact/74c9aa17-71d3-4f85-ba98-b05c94efe68e                                                                                                  3/13
+7/2/26, 11:05 PM                                                                                                             Architecture Compliance Audit -- Update
+
+                  7 new tests cover empty-log boot, full state reconstruction after a simulated crash,
+                  event-order preservation, determinism across repeated restarts, and zero
+                  duplication.
+
+Completion by component
+
+Same weighting as the baseline audit: each named sub-responsibility scored
+complete / partial / missing, percentage is the component average.
+
+COMPONENT                                                             BEFORE TREND  AFTER 
+
+Kernel                                                                   17%         67% +50
+Perception                                                               83%         83% --
+World Model                                                            100%         100% --
+
+https://claude.ai/code/artifact/74c9aa17-71d3-4f85-ba98-b05c94efe68e                                                                                                  4/13
+7/2/26, 11:05 PM                                                      BEFORE     Architecture Compliance Audit -- Update  AFTER 
+
+            COMPONENT                                                         TREND                                        30% --
+                                                                                                                           63% --
+         Executive                                                    30%                                                  25% --
+         Governor
+         Executor                                                     63%                                                    6% --
+         Memory & Ledger                                                                                                  100% --
+         Inference Port                                               25%
+
+                                                                      6%
+
+                                                                      100%
+
+Kernel, in detail
+
+The only component whose score moved. Four of six named responsibilities
+are now complete -- up from one.
+
+https://claude.ai/code/artifact/74c9aa17-71d3-4f85-ba98-b05c94efe68e                                                                5/13
+7/2/26, 11:05 PM                                                                Architecture Compliance Audit -- Update
+
+            RESPONSIBILITY  BEFORE                                              AFTER      NOTE
+
+event log semantics                                                   complete  unchanged  Already complete at baseline.
+
+scheduler                                                             missing   complete   FIFO Scheduler now owns queueing
+                                                                                           Kernel delegates
+                                                                                           publish/process_next/run_until
+                                                                                           to it. Landed just before this pass, ah
+                                                                                           of #16/#17.
+
+timers                                                                missing   missing    Scheduler is pure FIFO -- no "fire at/
+                                                                                           T" primitive yet. Belief decay is still in
+                                                                                           manually. Roadmap item 5, second h
+
+replay                                                                missing   complete   Task #17. Kernel.replay() dispatc
+                                                                                           persisted events through live subscr
+                                                                                           handlers, exactly once each, before
+                                                                                           start() admits any new work.
+
+https://claude.ai/code/artifact/74c9aa17-71d3-4f85-ba98-b05c94efe68e                                                                   6/13
+7/2/26, 11:05 PM                                                      Architecture Compliance Audit -- Update
+
+            RESPONSIBILITY  BEFORE                                    AFTER     NOTE
+                              missing
+         crash recovery                                               complete  Kill the process, reopen the same
+                              missing                                           EventLog path, rebuild the organism
+         snapshotting                                                           start() -- verified deterministic ac
+                                                                                repeated restarts by test_replay.p
+                                                                                Governor's constitution/budget are
+                                                                                supplied as boot config, not replaye
+                                                                                were never event-sourced -- see
+                                                                                Governor's own gap, unchanged).
+
+                                                                      missing   data/snapshots/ is still an empty s
+                                                                                Replay currently means "re-read the
+                                                                                log from event zero" -- fine at today
+                                                                                volume, roadmap item 4.
+
+Architecture-wide checks
+
+https://claude.ai/code/artifact/74c9aa17-71d3-4f85-ba98-b05c94efe68e                                                   7/13
+7/2/26, 11:05 PM                                                      Architecture Compliance Audit -- Update
+
+            CHECK                                                     BEFORE   AFTER                           NOTE
+
+         Persistence                                                  missing  complete                        EventLog is JSONL on dis
+                                                                                                               per append. Component
+         Recovery                                                     missing  complete                        (BeliefStore, PlanStore, ...
+                                                                                                               purely in memory by des
+https://claude.ai/code/artifact/74c9aa17-71d3-4f85-ba98-b05c94efe68e                                           no longer need their own
+                                                                                                               persistence, because rep
+                                                                                                               reconstructs them from t
+                                                                                                               log.
+
+                                                                                                               Same root cause as pers
+                                                                                                               now closed by the same
+                                                                                                               main.build_organism(
+                                                                                                               accepts a pre-wired Kern
+                                                                                                               reboot can point at the s
+                                                                                                               path.
+
+                                                                                                                                             8/13
+7/2/26, 11:05 PM                                                      Architecture Compliance Audit -- Update
+
+            CHECK                                                     BEFORE       AFTER                       NOTE
+
+         Composition root                                             missing      complete                    Task #16. First point the w
+         Determinism                                                                                           organism is provably aliv
+                                                                                                               unit test.
+         Auditability
+                                                                      no           complete                    Replay-determinism now
+         Missing events                                               violations,                              tested across three sequ
+                                                                      replay                                   restarts on the same log.
+https://claude.ai/code/artifact/74c9aa17-71d3-4f85-ba98-b05c94efe68e  unverified                               caveat below.
+
+                                                                      partial      unchanged                   correlation_id is still N
+                                                                                                               every event -- roadmap
+                                                                                                               cheapest item on the bo
+                                                                                                               not picked up by either t
+
+                                                                      partial      unchanged                   PlanAbandonedEvent /
+                                                                                                               ExecutiveDecisionEve
+                                                                                                               defined, still never publis
+
+                                                                                                                                                                                              9/13
+7/2/26, 11:05 PM                                                      Architecture Compliance Audit -- Update
+
+            CHECK                                                     BEFORE  AFTER                            NOTE
+
+Ownership & cross-store access                                        clean   clean                            timer-fired event still exi
+                                                                                                               still missing).
+
+                                                                                                               Held through both tasks
+                                                                                                               now imports every comp
+                                                                                                               that's the composition ro
+                                                                                                               components still only im
+                                                                                                               src.events and src.ke
+
+A finding from building Task #17
+
+Reconstructed state is identical to uninterrupted execution for everything the
+architecture actually asks to be identical -- belief confidence, plan/approval counts,
+budget deltas, outcome success, ledger entries. It is not identical for internal record
+IDs: Executor, Executive, Governor, and Memory & Ledger each mint a fresh
+uuid4() inside the handler on every run rather than deriving it from the event, so
+
+https://claude.ai/code/artifact/74c9aa17-71d3-4f85-ba98-b05c94efe68e                                                                        10/13
+7/2/26, 11:05 PM                                                      Architecture Compliance Audit -- Update
+
+action_id and friends differ between an original run and its replay. Not a defect --
+
+those IDs were never part of the durable identity axiom -- but worth knowing before
+
+anyone writes a test (or a downstream feature) that assumes replay reproduces IDs
+
+byte-for-byte.
+
+Roadmap: where the 18-item board stands
+
+01 Populate correlation_id on every publish not started
+
+       Still the cheapest open item. Neither #16 nor #17 touched it.
+
+02 Kernel: disk persistence for the event log done
+
+       Landed ahead of this pass, immediately unblocked #3.
+
+03 Kernel: replay-on-start done -- Task #17
+
+04 Kernel: snapshotting not started
+
+       Log is small; not urgent yet, but grows unbounded until this exists.
+
+https://claude.ai/code/artifact/74c9aa17-71d3-4f85-ba98-b05c94efe68e                                           11/13
+7/2/26, 11:05 PM                                                      Architecture Compliance Audit -- Update
+
+05 Kernel: scheduler + timer table half done
+
+       FIFO scheduler shipped just before this pass. The timer half ("fire at/after T") is still open.
+
+06 Wire the composition root done -- Task #16
+
+Items 07­18 unchanged -- still open, in original order: Perception normalization adapters,
+Executive/Governor capital & attention allocation against live budget, Executive  Inference
+Port wiring for EV estimation, Executive ranking & plan selection, Governor rule engine +
+owner-approved amendment path, Governor real escalation path, Executor sandboxing,
+Executor retries, Executor credentials, Memory & Ledger prediction tracking, medium learning
+loop, slow learning loop. None of these were in scope for #16 or #17, and none regressed.
+
+https://claude.ai/code/artifact/74c9aa17-71d3-4f85-ba98-b05c94efe68e                                           12/13
+7/2/26, 11:05 PM                                                      Architecture Compliance Audit -- Update
+
+spawn/ · read-only audit · no code modified 177/177 tests passing at time of this audit
+
+https://claude.ai/code/artifact/74c9aa17-71d3-4f85-ba98-b05c94efe68e                                           13/13
+
