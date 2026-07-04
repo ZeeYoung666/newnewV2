@@ -1,21 +1,31 @@
 """Memory & Ledger: records outcomes, episodic memory, financial ledger, learned heuristics.
 
-Owns episodic memory, the financial ledger, and learned heuristics. Reacts to
-executed actions; does not update the Executive, score predictions, or learn.
+Owns episodic memory, the financial ledger, prediction history, and learned
+heuristics. Reacts to executed actions and resolves predictions against
+their outcomes, running the Medium Learning Loop to revise heuristics from
+accumulated prediction error. Never updates the Executive, Governor,
+Executor, or World Model directly, and does not (yet) distill playbooks or
+anti-patterns — that is the Slow Learning Loop's job.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Optional
 from uuid import uuid4
 
 from src.events import (
     ActionFailedEvent,
     ActionSucceededEvent,
     EventType,
+    LearningIterationCompletedEvent,
+    LearningIterationStartedEvent,
     LedgerEntryPostedEvent,
     OutcomeRecordedEvent,
+    PlanProposedEvent,
+    PredictionRecordedEvent,
+    PredictionResolvedEvent,
 )
 from src.kernel import Kernel
 
@@ -126,6 +136,116 @@ class HeuristicStore:
         return list(self._heuristics)
 
 
+@dataclass(slots=True, kw_only=True, frozen=True)
+class PredictionRecord:
+    """An immutable audit trail entry for one prediction lifecycle transition.
+
+    One record is appended per transition (pending, then resolved) — never
+    mutated — mirroring the Governor's Amendment/Escalation record shape,
+    so the full history survives in PredictionLedger even though `status`
+    only ever describes that single transition. This is raw experience for
+    later learning loops to consume — it does not itself learn anything.
+    """
+
+    prediction_id: str
+    plan_id: str
+    predicted_value: float
+    status: str
+    created_at: datetime
+    outcome_id: Optional[str] = None
+    actual_value: Optional[float] = None
+    prediction_error: Optional[float] = None
+    resolved_at: Optional[datetime] = None
+
+
+class PredictionLedger:
+    """Append-only log of prediction lifecycle transitions.
+
+    A prediction_id can appear more than once (pending, then resolved) —
+    read_all() returns every transition ever recorded, in order.
+    """
+
+    def __init__(self) -> None:
+        self._records: list[PredictionRecord] = []
+
+    def append(self, record: PredictionRecord) -> None:
+        self._records.append(record)
+
+    def read_all(self) -> list[PredictionRecord]:
+        return list(self._records)
+
+    def history_for(self, prediction_id: str) -> list[PredictionRecord]:
+        """All transitions recorded for a single prediction, in order."""
+        return [record for record in self._records if record.prediction_id == prediction_id]
+
+
+@dataclass(slots=True, kw_only=True, frozen=True)
+class LearningIteration:
+    """An immutable audit trail entry for one Medium Learning Loop pass.
+
+    One record is appended per transition (started, then completed) — never
+    mutated — mirroring PredictionRecord's shape, so the full history
+    survives in LearningLedger even though `status` only ever describes
+    that single transition.
+    """
+
+    iteration_id: str
+    status: str
+    predictions_considered: int
+    started_at: datetime
+    completed_at: Optional[datetime] = None
+    mean_prediction_error: Optional[float] = None
+    heuristic_id: Optional[str] = None
+
+
+class LearningLedger:
+    """Append-only log of Medium Learning Loop iteration transitions.
+
+    An iteration_id can appear more than once (started, then completed) —
+    read_all() returns every transition ever recorded, in order.
+    """
+
+    def __init__(self) -> None:
+        self._records: list[LearningIteration] = []
+
+    def append(self, record: LearningIteration) -> None:
+        self._records.append(record)
+
+    def read_all(self) -> list[LearningIteration]:
+        return list(self._records)
+
+    def history_for(self, iteration_id: str) -> list[LearningIteration]:
+        """All transitions recorded for a single iteration, in order."""
+        return [record for record in self._records if record.iteration_id == iteration_id]
+
+
+class MediumLearner:
+    """Deterministic, stateless computation for the Medium Learning Loop.
+
+    Owns no store of its own — MemoryLedger owns LearningLedger and
+    HeuristicStore. Given the same resolved-prediction history, this
+    always returns the same values, which is what makes replay and
+    repeated runs over identical history produce identical heuristics.
+    """
+
+    def compute_mean_error(self, resolved_predictions: list[PredictionRecord]) -> float:
+        """The mean prediction_error across every resolved prediction handed in."""
+        errors = [record.prediction_error for record in resolved_predictions if record.prediction_error is not None]
+        if not errors:
+            return 0.0
+        return sum(errors) / len(errors)
+
+    def compute_confidence(self, predictions_considered: int) -> float:
+        """More accumulated history yields higher confidence, capped short of certainty."""
+        return min(0.99, predictions_considered / (predictions_considered + 5))
+
+    def describe(self, *, mean_prediction_error: float, predictions_considered: int) -> str:
+        return (
+            f"calibration: mean prediction error {mean_prediction_error:.6f} "
+            f"over {predictions_considered} resolved predictions"
+        )
+
+
 class MemoryLedger:
     """Records outcomes, episodic memory, and ledger entries for every executed action."""
 
@@ -135,8 +255,18 @@ class MemoryLedger:
         self.episodic_memory_store = EpisodicMemoryStore()
         self.financial_ledger = FinancialLedger()
         self.heuristic_store = HeuristicStore()
+        self.prediction_ledger = PredictionLedger()
+        self.learning_ledger = LearningLedger()
+        self.medium_learner = MediumLearner()
+        self._pending_predictions: dict[str, PredictionRecord] = {}
         kernel.register_subscriber(EventType.ACTION_SUCCEEDED, self._on_action_succeeded)
         kernel.register_subscriber(EventType.ACTION_FAILED, self._on_action_failed)
+        kernel.register_subscriber(EventType.PLAN_PROPOSED, self._on_plan_proposed)
+        kernel.register_subscriber(EventType.PREDICTION_RECORDED, self._on_prediction_recorded)
+        kernel.register_subscriber(EventType.OUTCOME_RECORDED, self._on_outcome_recorded_for_prediction)
+        kernel.register_subscriber(EventType.PREDICTION_RESOLVED, self._on_prediction_resolved)
+        kernel.register_subscriber(EventType.LEARNING_ITERATION_STARTED, self._on_learning_iteration_started)
+        kernel.register_subscriber(EventType.LEARNING_ITERATION_COMPLETED, self._on_learning_iteration_completed)
         kernel.register_snapshot_source(
             "memory.outcomes", Outcome, self.outcome_store.read_all, self._restore_outcomes
         )
@@ -148,6 +278,18 @@ class MemoryLedger:
         )
         kernel.register_snapshot_source(
             "memory.ledger_entries", LedgerEntry, self.financial_ledger.read_all, self._restore_ledger_entries
+        )
+        kernel.register_snapshot_source(
+            "memory.predictions", PredictionRecord, self.prediction_ledger.read_all, self._restore_predictions
+        )
+        kernel.register_snapshot_source(
+            "memory.learning_iterations",
+            LearningIteration,
+            self.learning_ledger.read_all,
+            self._restore_learning_iterations,
+        )
+        kernel.register_snapshot_source(
+            "memory.heuristics", Heuristic, self.heuristic_store.read_all, self._restore_heuristics
         )
 
     def _restore_outcomes(self, outcomes: list[Outcome]) -> None:
@@ -161,6 +303,155 @@ class MemoryLedger:
     def _restore_ledger_entries(self, entries: list[LedgerEntry]) -> None:
         for entry in entries:
             self.financial_ledger.append(entry)
+
+    def _restore_learning_iterations(self, records: list[LearningIteration]) -> None:
+        for record in records:
+            self.learning_ledger.append(record)
+
+    def _restore_heuristics(self, heuristics: list[Heuristic]) -> None:
+        for heuristic in heuristics:
+            self.heuristic_store.append(heuristic)
+
+    def _restore_predictions(self, records: list[PredictionRecord]) -> None:
+        for record in records:
+            self.prediction_ledger.append(record)
+        latest_by_plan: dict[str, PredictionRecord] = {}
+        for record in records:
+            latest_by_plan[record.plan_id] = record
+        self._pending_predictions = {
+            plan_id: record for plan_id, record in latest_by_plan.items() if record.status == "pending"
+        }
+
+    def _on_plan_proposed(self, event: PlanProposedEvent) -> None:
+        """Record a prediction before execution: the plan's expected value.
+
+        Publishes PredictionRecordedEvent, which is what actually stores it
+        (via this component's own subscriber), so recording is
+        replay-correct. Whether the plan is ever approved or executed is
+        unknown at this point; an unmatched prediction simply stays pending.
+        """
+        self._kernel.publish(
+            PredictionRecordedEvent(
+                source_component="memory_ledger",
+                prediction_id=str(uuid4()),
+                plan_id=event.plan_id,
+                predicted_value=event.expected_value,
+            )
+        )
+
+    def _on_prediction_recorded(self, event: PredictionRecordedEvent) -> None:
+        record = PredictionRecord(
+            prediction_id=event.prediction_id,
+            plan_id=event.plan_id,
+            predicted_value=event.predicted_value,
+            status="pending",
+            created_at=event.timestamp,
+        )
+        self.prediction_ledger.append(record)
+        self._pending_predictions[event.plan_id] = record
+
+    def _on_outcome_recorded_for_prediction(self, event: OutcomeRecordedEvent) -> None:
+        """Resolve the plan's pending prediction against its first arriving outcome.
+
+        A plan may execute several actions (several outcomes); the pending
+        entry is claimed (popped) synchronously, right here, so a second
+        outcome for the same plan finds nothing pending and is ignored —
+        this must happen before publishing, not inside the subscriber for
+        the resolution event, since the Kernel's FIFO scheduler would
+        otherwise dispatch a second plan outcome before the first
+        resolution event and double-resolve.
+        """
+        pending = self._pending_predictions.pop(event.plan_id, None)
+        if pending is None:
+            return
+        actual_value = pending.predicted_value if event.success else 0.0
+        prediction_error = actual_value - pending.predicted_value
+        self._kernel.publish(
+            PredictionResolvedEvent(
+                source_component="memory_ledger",
+                prediction_id=pending.prediction_id,
+                plan_id=event.plan_id,
+                outcome_id=event.outcome_id,
+                predicted_value=pending.predicted_value,
+                actual_value=actual_value,
+                prediction_error=prediction_error,
+            )
+        )
+
+    def _on_prediction_resolved(self, event: PredictionResolvedEvent) -> None:
+        proposed = self.prediction_ledger.history_for(event.prediction_id)[0]
+        self.prediction_ledger.append(
+            PredictionRecord(
+                prediction_id=event.prediction_id,
+                plan_id=event.plan_id,
+                predicted_value=event.predicted_value,
+                status="resolved",
+                created_at=proposed.created_at,
+                outcome_id=event.outcome_id,
+                actual_value=event.actual_value,
+                prediction_error=event.prediction_error,
+                resolved_at=event.timestamp,
+            )
+        )
+
+        # Every newly resolved prediction is one "per outcome" tick of the
+        # Medium Learning Loop: publishing here (rather than mutating
+        # directly) is what keeps the loop replay-correct.
+        resolved_predictions = [record for record in self.prediction_ledger.read_all() if record.status == "resolved"]
+        self._kernel.publish(
+            LearningIterationStartedEvent(
+                source_component="memory_ledger",
+                iteration_id=str(uuid4()),
+                predictions_considered=len(resolved_predictions),
+            )
+        )
+
+    def _on_learning_iteration_started(self, event: LearningIterationStartedEvent) -> None:
+        self.learning_ledger.append(
+            LearningIteration(
+                iteration_id=event.iteration_id,
+                status="started",
+                predictions_considered=event.predictions_considered,
+                started_at=event.timestamp,
+            )
+        )
+
+        resolved_predictions = [record for record in self.prediction_ledger.read_all() if record.status == "resolved"]
+        mean_prediction_error = self.medium_learner.compute_mean_error(resolved_predictions)
+        self._kernel.publish(
+            LearningIterationCompletedEvent(
+                source_component="memory_ledger",
+                iteration_id=event.iteration_id,
+                predictions_considered=event.predictions_considered,
+                mean_prediction_error=mean_prediction_error,
+                heuristic_id=str(uuid4()),
+            )
+        )
+
+    def _on_learning_iteration_completed(self, event: LearningIterationCompletedEvent) -> None:
+        proposed = self.learning_ledger.history_for(event.iteration_id)[0]
+        self.learning_ledger.append(
+            LearningIteration(
+                iteration_id=event.iteration_id,
+                status="completed",
+                predictions_considered=event.predictions_considered,
+                started_at=proposed.started_at,
+                completed_at=event.timestamp,
+                mean_prediction_error=event.mean_prediction_error,
+                heuristic_id=event.heuristic_id,
+            )
+        )
+        self.heuristic_store.append(
+            Heuristic(
+                heuristic_id=event.heuristic_id,
+                description=self.medium_learner.describe(
+                    mean_prediction_error=event.mean_prediction_error,
+                    predictions_considered=event.predictions_considered,
+                ),
+                confidence=self.medium_learner.compute_confidence(event.predictions_considered),
+                created_at=event.timestamp,
+            )
+        )
 
     def _on_action_succeeded(self, event: ActionSucceededEvent) -> None:
         self._record(
@@ -236,9 +527,14 @@ __all__ = [
     "EpisodicMemoryEntry",
     "LedgerEntry",
     "Heuristic",
+    "PredictionRecord",
+    "LearningIteration",
     "OutcomeStore",
     "EpisodicMemoryStore",
     "FinancialLedger",
     "HeuristicStore",
+    "PredictionLedger",
+    "LearningLedger",
+    "MediumLearner",
     "MemoryLedger",
 ]

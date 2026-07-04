@@ -47,13 +47,19 @@ class BuildOrganismTests(unittest.TestCase):
         self.assertEqual(subscriber_counts.get(EventType.OBSERVATION_CREATED), 1)
         self.assertEqual(subscriber_counts.get(EventType.BELIEF_CREATED), 1)
         self.assertEqual(subscriber_counts.get(EventType.BELIEF_UPDATED), 1)
-        self.assertEqual(subscriber_counts.get(EventType.PLAN_PROPOSED), 1)
+        # Governor (policy evaluation) and MemoryLedger (prediction recording)
+        # both react to a proposed plan — the one deliberate fan-out in this wiring.
+        self.assertEqual(subscriber_counts.get(EventType.PLAN_PROPOSED), 2)
         self.assertEqual(subscriber_counts.get(EventType.APPROVAL_GRANTED), 1)
         self.assertEqual(subscriber_counts.get(EventType.ACTION_SUCCEEDED), 1)
         self.assertEqual(subscriber_counts.get(EventType.ACTION_FAILED), 1)
 
-        # No event type should ever have more than one subscriber in this wiring.
+        # No event type should ever have more than one subscriber in this wiring,
+        # except the deliberate fan-out above.
+        multi_subscriber_event_types = {EventType.PLAN_PROPOSED}
         for event_type, count in subscriber_counts.items():
+            if event_type in multi_subscriber_event_types:
+                continue
             self.assertLessEqual(count, 1, f"{event_type} has {count} subscribers, expected at most 1")
 
     def test_building_twice_yields_independent_kernels(self) -> None:
@@ -121,6 +127,7 @@ class BootstrapCycleTests(unittest.TestCase):
                 EventType.POLICY_EVALUATED,
                 EventType.BUDGET_CHECKED,
                 EventType.APPROVAL_GRANTED,
+                EventType.PREDICTION_RECORDED,
                 EventType.ACTION_APPROVED,
                 EventType.ACTION_ATTEMPTED,
                 EventType.SANDBOX_EXECUTION_STARTED,
@@ -135,6 +142,9 @@ class BootstrapCycleTests(unittest.TestCase):
                 EventType.LEDGER_ENTRY_POSTED,
                 EventType.OUTCOME_RECORDED,
                 EventType.LEDGER_ENTRY_POSTED,
+                EventType.PREDICTION_RESOLVED,
+                EventType.LEARNING_ITERATION_STARTED,
+                EventType.LEARNING_ITERATION_COMPLETED,
             ],
         )
 
@@ -146,7 +156,7 @@ class BootstrapCycleTests(unittest.TestCase):
         cascade = self.organism.kernel.event_log.read_from(start_sequence)
         correlation_ids = {event.correlation_id for _, event in cascade}
 
-        self.assertEqual(len(cascade), 22)
+        self.assertEqual(len(cascade), 26)
         self.assertEqual(len(correlation_ids), 1)
         self.assertIsNotNone(next(iter(correlation_ids)))
 
@@ -162,8 +172,8 @@ class BootstrapCycleTests(unittest.TestCase):
         first_ids = {event.correlation_id for event in first_cascade}
         second_ids = {event.correlation_id for event in second_cascade}
 
-        self.assertEqual(len(first_cascade), 22)
-        self.assertEqual(len(second_cascade), 22)
+        self.assertEqual(len(first_cascade), 26)
+        self.assertEqual(len(second_cascade), 26)
         self.assertEqual(len(first_ids), 1)
         self.assertEqual(len(second_ids), 1)
         self.assertNotEqual(first_ids, second_ids)

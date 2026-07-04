@@ -24,6 +24,8 @@ from src.events import (
     ExecutiveDecisionEvent,
     InferenceCompletedEvent,
     InferenceRequestedEvent,
+    LearningIterationCompletedEvent,
+    LearningIterationStartedEvent,
     LedgerEntryPostedEvent,
     ObservationCreatedEvent,
     OpportunityIdentifiedEvent,
@@ -32,6 +34,8 @@ from src.events import (
     PlanAbandonedEvent,
     PlanProposedEvent,
     PolicyEvaluatedEvent,
+    PredictionRecordedEvent,
+    PredictionResolvedEvent,
     SandboxExecutionCompletedEvent,
     SandboxExecutionStartedEvent,
 )
@@ -173,6 +177,33 @@ class EventModelTests(unittest.TestCase):
             credential_id="credential-1",
             action_type="send_email",
         )
+        prediction_recorded_event = PredictionRecordedEvent(
+            source_component="memory_ledger",
+            prediction_id="prediction-1",
+            plan_id="plan-1",
+            predicted_value=60.0,
+        )
+        prediction_resolved_event = PredictionResolvedEvent(
+            source_component="memory_ledger",
+            prediction_id="prediction-1",
+            plan_id="plan-1",
+            outcome_id="outcome-1",
+            predicted_value=60.0,
+            actual_value=60.0,
+            prediction_error=0.0,
+        )
+        learning_iteration_started_event = LearningIterationStartedEvent(
+            source_component="memory_ledger",
+            iteration_id="iteration-1",
+            predictions_considered=3,
+        )
+        learning_iteration_completed_event = LearningIterationCompletedEvent(
+            source_component="memory_ledger",
+            iteration_id="iteration-1",
+            predictions_considered=3,
+            mean_prediction_error=-4.5,
+            heuristic_id="heuristic-1",
+        )
         execution_event = ActionAttemptedEvent(
             source_component="executor",
             action_id="action-1",
@@ -272,6 +303,10 @@ class EventModelTests(unittest.TestCase):
         self.assertEqual(credential_registered_event.event_type, EventType.CREDENTIAL_REGISTERED)
         self.assertEqual(credential_updated_event.event_type, EventType.CREDENTIAL_UPDATED)
         self.assertEqual(credential_revoked_event.event_type, EventType.CREDENTIAL_REVOKED)
+        self.assertEqual(prediction_recorded_event.event_type, EventType.PREDICTION_RECORDED)
+        self.assertEqual(prediction_resolved_event.event_type, EventType.PREDICTION_RESOLVED)
+        self.assertEqual(learning_iteration_started_event.event_type, EventType.LEARNING_ITERATION_STARTED)
+        self.assertEqual(learning_iteration_completed_event.event_type, EventType.LEARNING_ITERATION_COMPLETED)
         self.assertEqual(policy_evaluated_event.event_type, EventType.POLICY_EVALUATED)
         self.assertEqual(budget_checked_event.event_type, EventType.BUDGET_CHECKED)
         self.assertEqual(execution_event.event_type, EventType.ACTION_ATTEMPTED)

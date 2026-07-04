@@ -42,6 +42,10 @@ class EventType(str, Enum):
     ACTION_SUCCEEDED = "action.succeeded"
     ACTION_FAILED = "action.failed"
     OUTCOME_RECORDED = "outcome.recorded"
+    PREDICTION_RECORDED = "prediction.recorded"
+    PREDICTION_RESOLVED = "prediction.resolved"
+    LEARNING_ITERATION_STARTED = "learning.iteration_started"
+    LEARNING_ITERATION_COMPLETED = "learning.iteration_completed"
     LEDGER_ENTRY_POSTED = "ledger.entry_posted"
     INFERENCE_REQUESTED = "inference.requested"
     INFERENCE_COMPLETED = "inference.completed"
@@ -393,6 +397,49 @@ class OutcomeRecordedEvent(Event):
 
 
 @dataclass(slots=True, kw_only=True)
+class PredictionRecordedEvent(Event):
+    """Represents a prediction recorded before execution, for later comparison against its outcome."""
+
+    prediction_id: str
+    plan_id: str
+    predicted_value: float
+    event_type: EventType = EventType.PREDICTION_RECORDED
+
+
+@dataclass(slots=True, kw_only=True)
+class PredictionResolvedEvent(Event):
+    """Represents a prediction resolved against its matching outcome."""
+
+    prediction_id: str
+    plan_id: str
+    outcome_id: str
+    predicted_value: float
+    actual_value: float
+    prediction_error: float
+    event_type: EventType = EventType.PREDICTION_RESOLVED
+
+
+@dataclass(slots=True, kw_only=True)
+class LearningIterationStartedEvent(Event):
+    """Represents one Medium Learning Loop pass beginning over accumulated prediction history."""
+
+    iteration_id: str
+    predictions_considered: int
+    event_type: EventType = EventType.LEARNING_ITERATION_STARTED
+
+
+@dataclass(slots=True, kw_only=True)
+class LearningIterationCompletedEvent(Event):
+    """Represents a Medium Learning Loop pass finishing with a computed heuristic revision."""
+
+    iteration_id: str
+    predictions_considered: int
+    mean_prediction_error: float
+    heuristic_id: str
+    event_type: EventType = EventType.LEARNING_ITERATION_COMPLETED
+
+
+@dataclass(slots=True, kw_only=True)
 class LedgerEntryPostedEvent(Event):
     """Represents a financial ledger entry posted for an executed action."""
 
@@ -498,6 +545,10 @@ __all__ = [
     "ActionSucceededEvent",
     "ActionFailedEvent",
     "OutcomeRecordedEvent",
+    "PredictionRecordedEvent",
+    "PredictionResolvedEvent",
+    "LearningIterationStartedEvent",
+    "LearningIterationCompletedEvent",
     "LedgerEntryPostedEvent",
     "InferenceRequestedEvent",
     "InferenceCompletedEvent",
