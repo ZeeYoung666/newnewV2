@@ -22,6 +22,9 @@ from src.events import (
     EscalationCreatedEvent,
     EscalationResolvedEvent,
     EventType,
+    KnowledgeAppliedEvent,
+    KnowledgeIgnoredEvent,
+    KnowledgeRevisionCompletedEvent,
     PlanProposedEvent,
     PolicyEvaluatedEvent,
 )
@@ -176,6 +179,41 @@ class EscalationRecord:
     resolved_by: Optional[str] = None
 
 
+@dataclass(slots=True, kw_only=True, frozen=True)
+class LearnedKnowledge:
+    """The Governor's own view of one piece of long-term knowledge distilled by the Slow Learning Loop.
+
+    Populated exclusively from `KnowledgeRevisionCompletedEvent` fields — the
+    Governor never reads Memory's `LongTermKnowledgeStore` directly, per the
+    architecture's no-cross-store-access rule.
+    """
+
+    knowledge_id: str
+    knowledge_type: str
+    summary: str
+    consensus_confidence: float
+    heuristics_considered: int
+    learned_at: datetime
+
+
+@dataclass(slots=True, kw_only=True, frozen=True)
+class KnowledgeApplicationRecord:
+    """An immutable audit trail entry for one Governor decision to apply or ignore a piece of learned knowledge.
+
+    One record is appended per (plan, knowledge) evaluation — never mutated —
+    so `KnowledgeApplicationLedger` is a complete, append-only history of
+    every time learned knowledge was weighed against a governance decision.
+    """
+
+    application_id: str
+    knowledge_id: str
+    knowledge_type: str
+    plan_id: str
+    applied: bool
+    reason: str
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 class ConstitutionStore:
     """Append-only store of constitutions, keyed by constitution_id."""
 
@@ -281,6 +319,60 @@ class EscalationStore:
         return [record for record in self._records if record.escalation_id == escalation_id]
 
 
+class KnowledgeApplicationLedger:
+    """Append-only log of knowledge-application decisions, keyed by plan_id."""
+
+    def __init__(self) -> None:
+        self._records: list[KnowledgeApplicationRecord] = []
+
+    def append(self, record: KnowledgeApplicationRecord) -> None:
+        self._records.append(record)
+
+    def read_all(self) -> list[KnowledgeApplicationRecord]:
+        return list(self._records)
+
+    def history_for(self, plan_id: str) -> list[KnowledgeApplicationRecord]:
+        """All knowledge-application decisions recorded for a single plan, in order."""
+        return [record for record in self._records if record.plan_id == plan_id]
+
+
+# Confidence a piece of learned knowledge must reach before the Governor acts
+# on it. Below threshold it is recorded as ignored: not enough consensus yet
+# to let it move a governance decision.
+ANTI_PATTERN_CONFIDENCE_THRESHOLD = 0.5
+PLAYBOOK_CONFIDENCE_THRESHOLD = 0.5
+
+
+class KnowledgeAdvisor:
+    """The Governor's own, event-sourced view of applicable long-term knowledge.
+
+    Populated exclusively by the Governor's `KnowledgeRevisionCompletedEvent`
+    subscriber — never by reading Memory's `LongTermKnowledgeStore`. Knowledge
+    is purely advisory: it is consulted by the Governor only after the
+    Constitution and budget gates have already passed, so it can narrow what
+    those gates allowed but never widen it and never substitute for them.
+    """
+
+    def __init__(self) -> None:
+        self._playbooks: dict[str, LearnedKnowledge] = {}
+        self._anti_patterns: dict[str, LearnedKnowledge] = {}
+
+    def record(self, knowledge: LearnedKnowledge) -> None:
+        if knowledge.knowledge_type == "anti_pattern":
+            self._anti_patterns[knowledge.knowledge_id] = knowledge
+        else:
+            self._playbooks[knowledge.knowledge_id] = knowledge
+
+    def playbooks(self) -> list[LearnedKnowledge]:
+        return list(self._playbooks.values())
+
+    def anti_patterns(self) -> list[LearnedKnowledge]:
+        return list(self._anti_patterns.values())
+
+    def read_all(self) -> list[LearnedKnowledge]:
+        return list(self._playbooks.values()) + list(self._anti_patterns.values())
+
+
 class Governor:
     """Evaluates proposed plans against the constitution and budget, and authorizes or rejects them."""
 
@@ -292,6 +384,8 @@ class Governor:
         self.approval_log = ApprovalLog()
         self.amendment_log = AmendmentLog()
         self.escalation_store = EscalationStore()
+        self.knowledge_advisor = KnowledgeAdvisor()
+        self.knowledge_application_ledger = KnowledgeApplicationLedger()
         self._active_budget_id: Optional[str] = None
         self._pending_amendments: dict[str, Constitution] = {}
         self._pending_escalations: dict[str, EscalationRecord] = {}
@@ -301,6 +395,7 @@ class Governor:
         kernel.register_subscriber(EventType.CONSTITUTION_AMENDMENT_REJECTED, self._on_amendment_rejected)
         kernel.register_subscriber(EventType.ESCALATION_CREATED, self._on_escalation_created)
         kernel.register_subscriber(EventType.ESCALATION_RESOLVED, self._on_escalation_resolved)
+        kernel.register_subscriber(EventType.KNOWLEDGE_REVISION_COMPLETED, self._on_knowledge_revision_completed)
         kernel.register_snapshot_source(
             "governor.budgets", BudgetState, self.budget_store.read_all, self._restore_budgets
         )
@@ -315,6 +410,18 @@ class Governor:
         )
         kernel.register_snapshot_source(
             "governor.escalations", EscalationRecord, self.escalation_store.read_all, self._restore_escalations
+        )
+        kernel.register_snapshot_source(
+            "governor.learned_knowledge",
+            LearnedKnowledge,
+            self.knowledge_advisor.read_all,
+            self._restore_learned_knowledge,
+        )
+        kernel.register_snapshot_source(
+            "governor.knowledge_applications",
+            KnowledgeApplicationRecord,
+            self.knowledge_application_ledger.read_all,
+            self._restore_knowledge_applications,
         )
 
     def _restore_budgets(self, budgets: list[BudgetState]) -> None:
@@ -357,6 +464,14 @@ class Governor:
             for escalation_id, record in latest_by_id.items()
             if record.status == "pending"
         }
+
+    def _restore_learned_knowledge(self, records: list[LearnedKnowledge]) -> None:
+        for record in records:
+            self.knowledge_advisor.record(record)
+
+    def _restore_knowledge_applications(self, records: list[KnowledgeApplicationRecord]) -> None:
+        for record in records:
+            self.knowledge_application_ledger.append(record)
 
     def adopt_constitution(self, constitution: Constitution) -> None:
         """Adopt a constitution as the currently active one.
@@ -521,6 +636,24 @@ class Governor:
             )
         )
 
+    def _on_knowledge_revision_completed(self, event: KnowledgeRevisionCompletedEvent) -> None:
+        """Fold newly distilled long-term knowledge into the Governor's own view.
+
+        Sourced exclusively from the event's own fields — the Governor never
+        reads Memory's LongTermKnowledgeStore. Only plans proposed after this
+        point can be influenced by it (earlier decisions already happened).
+        """
+        self.knowledge_advisor.record(
+            LearnedKnowledge(
+                knowledge_id=event.knowledge_id,
+                knowledge_type=event.knowledge_type,
+                summary=event.summary,
+                consensus_confidence=event.consensus_confidence,
+                heuristics_considered=event.heuristics_considered,
+                learned_at=event.timestamp,
+            )
+        )
+
     def _on_plan_proposed(self, event: PlanProposedEvent) -> None:
         try:
             constitution = self.constitution_store.current()
@@ -568,11 +701,95 @@ class Governor:
             )
             return
 
-        self._grant(event.plan_id, budget, event)
+        # Learned knowledge is consulted last, only once the Constitution and
+        # budget have already cleared the plan: it can veto what they allowed
+        # (an enforced anti-pattern) but can never rescue what they denied —
+        # the Constitution always overrides conflicting learned knowledge.
+        veto_reason, support_reasons = self._apply_knowledge(event.plan_id)
+        if veto_reason is not None:
+            self._deny(event.plan_id, veto_reason)
+            return
 
-    def _grant(self, plan_id: str, budget: BudgetState, event: PlanProposedEvent) -> None:
+        self._grant(event.plan_id, budget, event, support_reasons)
+
+    def _apply_knowledge(self, plan_id: str) -> tuple[Optional[str], list[str]]:
+        """Evaluate every piece of long-term knowledge the Governor currently holds
+        against this plan, recording each as applied or ignored.
+
+        Anti-patterns at or above `ANTI_PATTERN_CONFIDENCE_THRESHOLD` veto the
+        plan (the first one, in knowledge_id order, supplies the reason);
+        playbooks at or above `PLAYBOOK_CONFIDENCE_THRESHOLD` never veto —
+        they only ever reinforce an approval already earned. Below threshold,
+        a piece of knowledge is recorded as ignored: not enough consensus yet
+        to move this decision. Returns (veto_reason_or_None, support_reasons).
+        """
+        veto_reason: Optional[str] = None
+        support_reasons: list[str] = []
+        for knowledge in sorted(self.knowledge_advisor.anti_patterns(), key=lambda k: k.knowledge_id):
+            applied = knowledge.consensus_confidence >= ANTI_PATTERN_CONFIDENCE_THRESHOLD
+            reason = (
+                f"anti-pattern {knowledge.knowledge_id} enforced: {knowledge.summary}"
+                if applied
+                else f"anti-pattern {knowledge.knowledge_id} below confidence threshold, not enforced"
+            )
+            self._record_knowledge_application(plan_id, knowledge, applied, reason)
+            if applied and veto_reason is None:
+                veto_reason = reason
+        for knowledge in sorted(self.knowledge_advisor.playbooks(), key=lambda k: k.knowledge_id):
+            applied = knowledge.consensus_confidence >= PLAYBOOK_CONFIDENCE_THRESHOLD
+            reason = (
+                f"playbook {knowledge.knowledge_id} applied: {knowledge.summary}"
+                if applied
+                else f"playbook {knowledge.knowledge_id} below confidence threshold, not applied"
+            )
+            self._record_knowledge_application(plan_id, knowledge, applied, reason)
+            if applied:
+                support_reasons.append(reason)
+        return veto_reason, support_reasons
+
+    def _record_knowledge_application(
+        self, plan_id: str, knowledge: LearnedKnowledge, applied: bool, reason: str
+    ) -> None:
+        application_id = str(uuid4())
+        self.knowledge_application_ledger.append(
+            KnowledgeApplicationRecord(
+                application_id=application_id,
+                knowledge_id=knowledge.knowledge_id,
+                knowledge_type=knowledge.knowledge_type,
+                plan_id=plan_id,
+                applied=applied,
+                reason=reason,
+            )
+        )
+        if applied:
+            self._kernel.publish(
+                KnowledgeAppliedEvent(
+                    source_component="governor",
+                    application_id=application_id,
+                    knowledge_id=knowledge.knowledge_id,
+                    knowledge_type=knowledge.knowledge_type,
+                    plan_id=plan_id,
+                    decision="deny" if knowledge.knowledge_type == "anti_pattern" else "support",
+                    reason=reason,
+                )
+            )
+        else:
+            self._kernel.publish(
+                KnowledgeIgnoredEvent(
+                    source_component="governor",
+                    application_id=application_id,
+                    knowledge_id=knowledge.knowledge_id,
+                    knowledge_type=knowledge.knowledge_type,
+                    plan_id=plan_id,
+                    reason=reason,
+                )
+            )
+
+    def _grant(
+        self, plan_id: str, budget: BudgetState, event: PlanProposedEvent, support_reasons: list[str]
+    ) -> None:
         approval_id = str(uuid4())
-        reason = "within policy and budget"
+        reason = "; ".join(["within policy and budget", *support_reasons])
         self.budget_store.put(
             BudgetState(
                 budget_id=budget.budget_id,

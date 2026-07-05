@@ -50,6 +50,8 @@ class EventType(str, Enum):
     LEARNING_ITERATION_COMPLETED = "learning.iteration_completed"
     KNOWLEDGE_REVISION_STARTED = "knowledge.revision_started"
     KNOWLEDGE_REVISION_COMPLETED = "knowledge.revision_completed"
+    KNOWLEDGE_APPLIED = "knowledge.applied"
+    KNOWLEDGE_IGNORED = "knowledge.ignored"
     SENSOR_RELIABILITY_UPDATED = "sensor.reliability_updated"
     LEDGER_ENTRY_POSTED = "ledger.entry_posted"
     INFERENCE_REQUESTED = "inference.requested"
@@ -475,6 +477,7 @@ class KnowledgeRevisionStartedEvent(Event):
 
     revision_id: str
     heuristics_considered: int
+    mean_prediction_error: float
     event_type: EventType = EventType.KNOWLEDGE_REVISION_STARTED
 
 
@@ -486,7 +489,34 @@ class KnowledgeRevisionCompletedEvent(Event):
     heuristics_considered: int
     consensus_confidence: float
     knowledge_id: str
+    knowledge_type: str
+    summary: str
     event_type: EventType = EventType.KNOWLEDGE_REVISION_COMPLETED
+
+
+@dataclass(slots=True, kw_only=True)
+class KnowledgeAppliedEvent(Event):
+    """Represents the Governor applying one piece of learned long-term knowledge to a plan's approval decision."""
+
+    application_id: str
+    knowledge_id: str
+    knowledge_type: str
+    plan_id: str
+    decision: str
+    reason: str
+    event_type: EventType = EventType.KNOWLEDGE_APPLIED
+
+
+@dataclass(slots=True, kw_only=True)
+class KnowledgeIgnoredEvent(Event):
+    """Represents the Governor evaluating a piece of learned knowledge but not applying it to a plan's decision."""
+
+    application_id: str
+    knowledge_id: str
+    knowledge_type: str
+    plan_id: str
+    reason: str
+    event_type: EventType = EventType.KNOWLEDGE_IGNORED
 
 
 @dataclass(slots=True, kw_only=True)
@@ -613,6 +643,8 @@ __all__ = [
     "LearningIterationCompletedEvent",
     "KnowledgeRevisionStartedEvent",
     "KnowledgeRevisionCompletedEvent",
+    "KnowledgeAppliedEvent",
+    "KnowledgeIgnoredEvent",
     "SensorReliabilityUpdatedEvent",
     "LedgerEntryPostedEvent",
     "InferenceRequestedEvent",

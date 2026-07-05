@@ -299,6 +299,7 @@ class LongTermKnowledge:
 
     knowledge_id: str
     summary: str
+    knowledge_type: str
     consensus_confidence: float
     heuristics_considered: int
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -344,6 +345,13 @@ class SlowLearner:
             f"knowledge consolidation: consensus confidence {consensus_confidence:.6f} "
             f"over {heuristics_considered} heuristics"
         )
+
+    def classify(self, mean_prediction_error: float) -> str:
+        """Repeated failures (a negative mean prediction error) distill into an
+        anti-pattern the Governor can enforce; a clean run of successes (zero
+        error) distills into a playbook it can apply.
+        """
+        return "anti_pattern" if mean_prediction_error < 0 else "playbook"
 
 
 @dataclass(slots=True, kw_only=True, frozen=True)
@@ -814,6 +822,7 @@ class MemoryLedger:
                     source_component="memory_ledger",
                     revision_id=str(uuid4()),
                     heuristics_considered=heuristics_considered,
+                    mean_prediction_error=event.mean_prediction_error,
                 )
             )
 
@@ -828,6 +837,11 @@ class MemoryLedger:
         )
 
         consensus_confidence = self.slow_learner.compute_consensus_confidence(self.heuristic_store.read_all())
+        knowledge_type = self.slow_learner.classify(event.mean_prediction_error)
+        summary = self.slow_learner.describe(
+            consensus_confidence=consensus_confidence,
+            heuristics_considered=event.heuristics_considered,
+        )
         self._kernel.publish(
             KnowledgeRevisionCompletedEvent(
                 source_component="memory_ledger",
@@ -835,6 +849,8 @@ class MemoryLedger:
                 heuristics_considered=event.heuristics_considered,
                 consensus_confidence=consensus_confidence,
                 knowledge_id=str(uuid4()),
+                knowledge_type=knowledge_type,
+                summary=summary,
             )
         )
 
@@ -854,10 +870,8 @@ class MemoryLedger:
         self.long_term_knowledge_store.append(
             LongTermKnowledge(
                 knowledge_id=event.knowledge_id,
-                summary=self.slow_learner.describe(
-                    consensus_confidence=event.consensus_confidence,
-                    heuristics_considered=event.heuristics_considered,
-                ),
+                summary=event.summary,
+                knowledge_type=event.knowledge_type,
                 consensus_confidence=event.consensus_confidence,
                 heuristics_considered=event.heuristics_considered,
                 created_at=event.timestamp,
