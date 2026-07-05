@@ -7,7 +7,7 @@ or rejects plans proposed by the Executive. It never creates or executes plans.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 from uuid import uuid4
 
@@ -27,8 +27,17 @@ from src.events import (
     KnowledgeRevisionCompletedEvent,
     PlanProposedEvent,
     PolicyEvaluatedEvent,
+    ResearchSpendApprovedEvent,
+    ResearchSpendDeniedEvent,
+    ResearchSpendRequestedEvent,
 )
 from src.kernel import Kernel
+
+# Fallback rolling-window length for the "research_budget" rule when its rule
+# string omits the optional window_seconds argument (e.g. "research_budget:500"
+# instead of "research_budget:500,86400"). One day, chosen as a sane default
+# for a per-window information-acquisition spend cap.
+DEFAULT_RESEARCH_BUDGET_WINDOW_SECONDS = 86400.0
 
 RuleEvaluator = Callable[[PlanProposedEvent, tuple[str, ...]], Optional[str]]
 
@@ -45,22 +54,71 @@ def _parse_rule(rule: str) -> tuple[str, tuple[str, ...]]:
 
 
 def _rule_non_negative_costs(event: PlanProposedEvent, args: tuple[str, ...]) -> Optional[str]:
-    if event.attention_cost < 0 or event.capital_cost < 0:
-        return f"attention_cost={event.attention_cost} capital_cost={event.capital_cost} must be >= 0"
+    attention_cost = getattr(event, "attention_cost", None)
+    capital_cost = getattr(event, "capital_cost", None)
+    if attention_cost is None and capital_cost is None:
+        return None
+    if (attention_cost is not None and attention_cost < 0) or (capital_cost is not None and capital_cost < 0):
+        return f"attention_cost={attention_cost} capital_cost={capital_cost} must be >= 0"
     return None
 
 
 def _rule_max_capital_cost(event: PlanProposedEvent, args: tuple[str, ...]) -> Optional[str]:
+    capital_cost = getattr(event, "capital_cost", None)
+    if capital_cost is None:
+        return None
     limit = float(args[0])
-    if event.capital_cost > limit:
-        return f"capital_cost={event.capital_cost} exceeds limit={limit}"
+    if capital_cost > limit:
+        return f"capital_cost={capital_cost} exceeds limit={limit}"
     return None
 
 
 def _rule_max_attention_cost(event: PlanProposedEvent, args: tuple[str, ...]) -> Optional[str]:
+    attention_cost = getattr(event, "attention_cost", None)
+    if attention_cost is None:
+        return None
     limit = float(args[0])
-    if event.attention_cost > limit:
-        return f"attention_cost={event.attention_cost} exceeds limit={limit}"
+    if attention_cost > limit:
+        return f"attention_cost={attention_cost} exceeds limit={limit}"
+    return None
+
+
+def _rule_max_search_depth(event: "ResearchRuleContext", args: tuple[str, ...]) -> Optional[str]:
+    search_depth = getattr(event, "search_depth", None)
+    if search_depth is None:
+        return None
+    limit = int(args[0])
+    if search_depth > limit:
+        return f"search_depth={search_depth} exceeds limit={limit}"
+    return None
+
+
+def _rule_max_searches_per_deliberation(event: "ResearchRuleContext", args: tuple[str, ...]) -> Optional[str]:
+    searches_this_deliberation = getattr(event, "searches_this_deliberation", None)
+    if searches_this_deliberation is None:
+        return None
+    limit = int(args[0])
+    if searches_this_deliberation > limit:
+        return f"searches_this_deliberation={searches_this_deliberation} exceeds limit={limit}"
+    return None
+
+
+def _rule_research_budget(event: "ResearchRuleContext", args: tuple[str, ...]) -> Optional[str]:
+    research_spend_in_window = getattr(event, "research_spend_in_window", None)
+    if research_spend_in_window is None:
+        return None
+    limit = float(args[0])
+    if research_spend_in_window > limit:
+        return f"research_spend_in_window={research_spend_in_window} exceeds research_budget={limit}"
+    return None
+
+
+def _find_rule_args(constitution: "Constitution", name: str) -> Optional[tuple[str, ...]]:
+    """The parsed args of the first rule named `name` in the constitution, or None if absent."""
+    for rule in constitution.rules:
+        rule_name, args = _parse_rule(rule)
+        if rule_name == name:
+            return args
     return None
 
 
@@ -68,6 +126,9 @@ DEFAULT_RULES: dict[str, RuleEvaluator] = {
     "non_negative_costs": _rule_non_negative_costs,
     "max_capital_cost": _rule_max_capital_cost,
     "max_attention_cost": _rule_max_attention_cost,
+    "max_search_depth": _rule_max_search_depth,
+    "max_searches_per_deliberation": _rule_max_searches_per_deliberation,
+    "research_budget": _rule_research_budget,
 }
 
 
@@ -212,6 +273,61 @@ class KnowledgeApplicationRecord:
     applied: bool
     reason: str
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass(slots=True, kw_only=True, frozen=True)
+class ResearchRuleContext:
+    """Adapts one research spend request into the shape the rule engine evaluates.
+
+    Reuses RuleRegistry/Constitution rather than a parallel mechanism: search
+    depth, per-deliberation search count, and rolling-window research spend
+    are config-driven caps declared as constitution rules (`max_search_depth`,
+    `max_searches_per_deliberation`, `research_budget`), evaluated the same
+    way `max_capital_cost`/`max_attention_cost` are for PlanProposedEvent.
+    """
+
+    search_depth: int
+    searches_this_deliberation: int
+    research_spend_in_window: float
+
+
+@dataclass(slots=True, kw_only=True, frozen=True)
+class ResearchSpendRecord:
+    """An immutable audit trail entry for one research spend decision.
+
+    Governor's own view, used to enforce the rolling-window budget and the
+    per-deliberation search cap — never reads Memory & Ledger's ledger.
+    """
+
+    request_id: str
+    deliberation_id: str
+    category: str
+    estimated_cost: float
+    search_depth: int
+    decision: str
+    reason: str
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class ResearchSpendLedger:
+    """Append-only log of research spend decisions, keyed by request_id."""
+
+    def __init__(self) -> None:
+        self._records: list[ResearchSpendRecord] = []
+
+    def append(self, record: ResearchSpendRecord) -> None:
+        self._records.append(record)
+
+    def read_all(self) -> list[ResearchSpendRecord]:
+        return list(self._records)
+
+    def for_deliberation(self, deliberation_id: str) -> list[ResearchSpendRecord]:
+        return [record for record in self._records if record.deliberation_id == deliberation_id]
+
+    def approved_within(self, *, now: datetime, window_seconds: float) -> list[ResearchSpendRecord]:
+        """Every approved spend recorded within `window_seconds` of `now`."""
+        cutoff = now - timedelta(seconds=window_seconds)
+        return [record for record in self._records if record.decision == "approved" and record.timestamp >= cutoff]
 
 
 class ConstitutionStore:
@@ -386,6 +502,7 @@ class Governor:
         self.escalation_store = EscalationStore()
         self.knowledge_advisor = KnowledgeAdvisor()
         self.knowledge_application_ledger = KnowledgeApplicationLedger()
+        self.research_spend_ledger = ResearchSpendLedger()
         self._active_budget_id: Optional[str] = None
         self._pending_amendments: dict[str, Constitution] = {}
         self._pending_escalations: dict[str, EscalationRecord] = {}
@@ -396,6 +513,7 @@ class Governor:
         kernel.register_subscriber(EventType.ESCALATION_CREATED, self._on_escalation_created)
         kernel.register_subscriber(EventType.ESCALATION_RESOLVED, self._on_escalation_resolved)
         kernel.register_subscriber(EventType.KNOWLEDGE_REVISION_COMPLETED, self._on_knowledge_revision_completed)
+        kernel.register_subscriber(EventType.RESEARCH_SPEND_REQUESTED, self._on_research_spend_requested)
         kernel.register_snapshot_source(
             "governor.budgets", BudgetState, self.budget_store.read_all, self._restore_budgets
         )
@@ -422,6 +540,12 @@ class Governor:
             KnowledgeApplicationRecord,
             self.knowledge_application_ledger.read_all,
             self._restore_knowledge_applications,
+        )
+        kernel.register_snapshot_source(
+            "governor.research_spend",
+            ResearchSpendRecord,
+            self.research_spend_ledger.read_all,
+            self._restore_research_spend,
         )
 
     def _restore_budgets(self, budgets: list[BudgetState]) -> None:
@@ -472,6 +596,10 @@ class Governor:
     def _restore_knowledge_applications(self, records: list[KnowledgeApplicationRecord]) -> None:
         for record in records:
             self.knowledge_application_ledger.append(record)
+
+    def _restore_research_spend(self, records: list[ResearchSpendRecord]) -> None:
+        for record in records:
+            self.research_spend_ledger.append(record)
 
     def adopt_constitution(self, constitution: Constitution) -> None:
         """Adopt a constitution as the currently active one.
@@ -712,6 +840,94 @@ class Governor:
 
         self._grant(event.plan_id, budget, event, support_reasons)
 
+    def _on_research_spend_requested(self, event: ResearchSpendRequestedEvent) -> None:
+        """Gate a research spend request against the active constitution's research rules.
+
+        Mirrors `_on_plan_proposed`'s shape (evaluate, then grant/deny) but
+        gates on category + estimated cost rather than a concrete plan or
+        event type, so a future ResearchIntentEvent fulfillment (Task #1)
+        can request approval through this same path without the Governor
+        needing to know that event's schema.
+        """
+        try:
+            constitution = self.constitution_store.current()
+        except LookupError:
+            self._deny_research(event, "no constitution configured")
+            return
+
+        budget_args = _find_rule_args(constitution, "research_budget")
+        if budget_args is None:
+            self._deny_research(event, "no research policy configured")
+            return
+
+        window_seconds = (
+            float(budget_args[1]) if len(budget_args) > 1 else DEFAULT_RESEARCH_BUDGET_WINDOW_SECONDS
+        )
+        now = datetime.now(timezone.utc)
+        consumed = sum(
+            record.estimated_cost
+            for record in self.research_spend_ledger.approved_within(now=now, window_seconds=window_seconds)
+        )
+        searches_this_deliberation = len(self.research_spend_ledger.for_deliberation(event.deliberation_id)) + 1
+
+        context = ResearchRuleContext(
+            search_depth=event.search_depth,
+            searches_this_deliberation=searches_this_deliberation,
+            research_spend_in_window=consumed + event.estimated_cost,
+        )
+        passed, reason = self._rule_registry.evaluate(constitution, context)
+        if not passed:
+            self._deny_research(event, reason)
+            return
+
+        self._approve_research(event)
+
+    def _approve_research(self, event: ResearchSpendRequestedEvent) -> None:
+        reason = "within research budget and caps"
+        self.research_spend_ledger.append(
+            ResearchSpendRecord(
+                request_id=event.request_id,
+                deliberation_id=event.deliberation_id,
+                category=event.category,
+                estimated_cost=event.estimated_cost,
+                search_depth=event.search_depth,
+                decision="approved",
+                reason=reason,
+            )
+        )
+        self._kernel.publish(
+            ResearchSpendApprovedEvent(
+                source_component="governor",
+                request_id=event.request_id,
+                deliberation_id=event.deliberation_id,
+                category=event.category,
+                approved_cost=event.estimated_cost,
+                reason=reason,
+            )
+        )
+
+    def _deny_research(self, event: ResearchSpendRequestedEvent, reason: str) -> None:
+        self.research_spend_ledger.append(
+            ResearchSpendRecord(
+                request_id=event.request_id,
+                deliberation_id=event.deliberation_id,
+                category=event.category,
+                estimated_cost=event.estimated_cost,
+                search_depth=event.search_depth,
+                decision="denied",
+                reason=reason,
+            )
+        )
+        self._kernel.publish(
+            ResearchSpendDeniedEvent(
+                source_component="governor",
+                request_id=event.request_id,
+                deliberation_id=event.deliberation_id,
+                category=event.category,
+                reason=reason,
+            )
+        )
+
     def _apply_knowledge(self, plan_id: str) -> tuple[Optional[str], list[str]]:
         """Evaluate every piece of long-term knowledge the Governor currently holds
         against this plan, recording each as applied or ignored.
@@ -897,6 +1113,9 @@ __all__ = [
     "EscalationRecord",
     "LearnedKnowledge",
     "KnowledgeApplicationRecord",
+    "ResearchRuleContext",
+    "ResearchSpendRecord",
+    "ResearchSpendLedger",
     "ConstitutionStore",
     "BudgetStore",
     "ApprovalLog",
@@ -906,6 +1125,7 @@ __all__ = [
     "KnowledgeAdvisor",
     "ANTI_PATTERN_CONFIDENCE_THRESHOLD",
     "PLAYBOOK_CONFIDENCE_THRESHOLD",
+    "DEFAULT_RESEARCH_BUDGET_WINDOW_SECONDS",
     "RuleRegistry",
     "RuleEvaluator",
     "DEFAULT_RULES",

@@ -28,6 +28,10 @@ BOOTSTRAP_AVAILABLE_ATTENTION = 100.0
 BOOTSTRAP_AVAILABLE_CAPITAL = 1000.0
 BOOTSTRAP_OBSERVATION_VALUE = 1.0
 BOOTSTRAP_OBSERVATION_CONFIDENCE = 0.9
+BOOTSTRAP_RESEARCH_BUDGET = 50.0
+BOOTSTRAP_RESEARCH_BUDGET_WINDOW_SECONDS = 86400.0
+BOOTSTRAP_MAX_SEARCHES_PER_DELIBERATION = 5
+BOOTSTRAP_MAX_SEARCH_DEPTH = 3
 
 
 @dataclass(slots=True)
@@ -97,7 +101,12 @@ def configure_bootstrap(organism: Organism) -> None:
         Constitution(
             constitution_id=BOOTSTRAP_CONSTITUTION_ID,
             version=1,
-            rules=("non_negative_costs",),
+            rules=(
+                "non_negative_costs",
+                f"research_budget:{BOOTSTRAP_RESEARCH_BUDGET},{BOOTSTRAP_RESEARCH_BUDGET_WINDOW_SECONDS}",
+                f"max_searches_per_deliberation:{BOOTSTRAP_MAX_SEARCHES_PER_DELIBERATION}",
+                f"max_search_depth:{BOOTSTRAP_MAX_SEARCH_DEPTH}",
+            ),
         )
     )
     organism.governor.fund_budget(

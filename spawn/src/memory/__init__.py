@@ -32,6 +32,7 @@ from src.events import (
     PlanProposedEvent,
     PredictionRecordedEvent,
     PredictionResolvedEvent,
+    ResearchSpendApprovedEvent,
     SensorReliabilityUpdatedEvent,
 )
 from src.kernel import Kernel
@@ -128,6 +129,43 @@ class FinancialLedger:
 
     def read_all(self) -> list[LedgerEntry]:
         return list(self._entries)
+
+
+@dataclass(slots=True, kw_only=True, frozen=True)
+class ResearchSpendRecord:
+    """An immutable audit trail entry for one recorded research spend.
+
+    Populated exclusively from ResearchSpendApprovedEvent fields — Memory
+    never reads the Governor's own ResearchSpendLedger directly, per the
+    architecture's no-cross-store-access rule. Keyed by correlation_id so
+    a later EV computation can net out research acquisition cost for the
+    whole causal chain a research spend belongs to.
+    """
+
+    request_id: str
+    correlation_id: str
+    category: str
+    cost: float
+    recorded_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class ResearchSpendLedger:
+    """Append-only log of recorded research spend, keyed by correlation_id."""
+
+    def __init__(self) -> None:
+        self._records: list[ResearchSpendRecord] = []
+
+    def append(self, record: ResearchSpendRecord) -> None:
+        self._records.append(record)
+
+    def read_all(self) -> list[ResearchSpendRecord]:
+        return list(self._records)
+
+    def for_correlation(self, correlation_id: str) -> list[ResearchSpendRecord]:
+        return [record for record in self._records if record.correlation_id == correlation_id]
+
+    def total_for_correlation(self, correlation_id: str) -> float:
+        return sum(record.cost for record in self.for_correlation(correlation_id))
 
 
 class HeuristicStore:
@@ -481,6 +519,7 @@ class MemoryLedger:
         self.slow_learner = SlowLearner()
         self.sensor_reliability_ledger = SensorReliabilityLedger()
         self.fast_learner = FastLearner()
+        self.research_spend_ledger = ResearchSpendLedger()
         self._pending_predictions: dict[str, PredictionRecord] = {}
         # Attribution chain built purely from published events (never reads
         # World Model's or Executive's own stores) so the Fast Learning Loop
@@ -502,6 +541,7 @@ class MemoryLedger:
         kernel.register_subscriber(EventType.KNOWLEDGE_REVISION_STARTED, self._on_knowledge_revision_started)
         kernel.register_subscriber(EventType.KNOWLEDGE_REVISION_COMPLETED, self._on_knowledge_revision_completed)
         kernel.register_subscriber(EventType.SENSOR_RELIABILITY_UPDATED, self._on_sensor_reliability_updated)
+        kernel.register_subscriber(EventType.RESEARCH_SPEND_APPROVED, self._on_research_spend_approved)
         kernel.register_snapshot_source(
             "memory.outcomes", Outcome, self.outcome_store.read_all, self._restore_outcomes
         )
@@ -561,6 +601,12 @@ class MemoryLedger:
             PlanSensorAttribution,
             self._capture_plan_sensor_attributions,
             self._restore_plan_sensor_attributions,
+        )
+        kernel.register_snapshot_source(
+            "memory.research_spend",
+            ResearchSpendRecord,
+            self.research_spend_ledger.read_all,
+            self._restore_research_spend,
         )
 
     def _restore_outcomes(self, outcomes: list[Outcome]) -> None:
@@ -634,6 +680,23 @@ class MemoryLedger:
     def _restore_plan_sensor_attributions(self, records: list[PlanSensorAttribution]) -> None:
         for record in records:
             self._sensors_for_plan[record.plan_id] = record.sensor_ids
+
+    def _restore_research_spend(self, records: list[ResearchSpendRecord]) -> None:
+        for record in records:
+            self.research_spend_ledger.append(record)
+
+    def _on_research_spend_approved(self, event: ResearchSpendApprovedEvent) -> None:
+        """Record actual research spend per correlation_id, sourced exclusively from
+        the Governor's own ResearchSpendApprovedEvent — never reads the Governor's
+        ResearchSpendLedger directly."""
+        self.research_spend_ledger.append(
+            ResearchSpendRecord(
+                request_id=event.request_id,
+                correlation_id=str(event.correlation_id) if event.correlation_id is not None else "",
+                category=event.category,
+                cost=event.approved_cost,
+            )
+        )
 
     def _on_belief_signal_for_reliability(self, event: BeliefCreatedEvent | BeliefUpdatedEvent) -> None:
         """Track which sensor stands behind each belief_id, via `provenance`
@@ -967,5 +1030,7 @@ __all__ = [
     "BeliefSensorAttribution",
     "OpportunitySensorAttribution",
     "PlanSensorAttribution",
+    "ResearchSpendRecord",
+    "ResearchSpendLedger",
     "MemoryLedger",
 ]

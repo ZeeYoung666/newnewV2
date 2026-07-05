@@ -1,6 +1,6 @@
 import dataclasses
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from src.events import (
     ApprovalDeniedEvent,
@@ -19,9 +19,13 @@ from src.events import (
     KnowledgeRevisionCompletedEvent,
     PlanProposedEvent,
     PolicyEvaluatedEvent,
+    ResearchSpendApprovedEvent,
+    ResearchSpendDeniedEvent,
+    ResearchSpendRequestedEvent,
 )
 from src.governor import (
     ANTI_PATTERN_CONFIDENCE_THRESHOLD,
+    DEFAULT_RESEARCH_BUDGET_WINDOW_SECONDS,
     PLAYBOOK_CONFIDENCE_THRESHOLD,
     Amendment,
     AmendmentLog,
@@ -38,9 +42,33 @@ from src.governor import (
     KnowledgeApplicationLedger,
     KnowledgeApplicationRecord,
     LearnedKnowledge,
+    ResearchRuleContext,
+    ResearchSpendLedger,
+    ResearchSpendRecord,
     RuleRegistry,
 )
 from src.kernel import EventLog, Kernel
+
+
+def publish_research_spend_requested(
+    kernel: Kernel,
+    *,
+    request_id: str = "request-1",
+    deliberation_id: str = "deliberation-1",
+    category: str = "research",
+    estimated_cost: float = 5.0,
+    search_depth: int = 1,
+) -> None:
+    kernel.publish(
+        ResearchSpendRequestedEvent(
+            source_component="executive",
+            request_id=request_id,
+            deliberation_id=deliberation_id,
+            category=category,
+            estimated_cost=estimated_cost,
+            search_depth=search_depth,
+        )
+    )
 
 
 def publish_plan_proposed(
@@ -1459,6 +1487,299 @@ class GovernorKnowledgeSnapshotTests(unittest.TestCase):
         self.assertEqual(
             restored_applications,
             governor.knowledge_application_ledger.read_all(),
+        )
+
+
+def _adopt_research_constitution(
+    governor: Governor,
+    *,
+    constitution_id: str = "research-constitution-1",
+    research_budget: float = 50.0,
+    window_seconds: float = DEFAULT_RESEARCH_BUDGET_WINDOW_SECONDS,
+    max_searches_per_deliberation: int = 5,
+    max_search_depth: int = 3,
+    extra_rules: tuple[str, ...] = (),
+) -> None:
+    governor.adopt_constitution(
+        Constitution(
+            constitution_id=constitution_id,
+            version=1,
+            rules=(
+                "non_negative_costs",
+                f"research_budget:{research_budget},{window_seconds}",
+                f"max_searches_per_deliberation:{max_searches_per_deliberation}",
+                f"max_search_depth:{max_search_depth}",
+                *extra_rules,
+            ),
+        )
+    )
+
+
+class ResearchRuleContextModelTests(unittest.TestCase):
+    def test_context_carries_required_fields(self) -> None:
+        context = ResearchRuleContext(search_depth=2, searches_this_deliberation=3, research_spend_in_window=10.0)
+
+        self.assertEqual(context.search_depth, 2)
+        self.assertEqual(context.searches_this_deliberation, 3)
+        self.assertEqual(context.research_spend_in_window, 10.0)
+
+    def test_context_is_immutable(self) -> None:
+        context = ResearchRuleContext(search_depth=2, searches_this_deliberation=3, research_spend_in_window=10.0)
+
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            context.search_depth = 5  # type: ignore[misc]
+
+
+class ResearchSpendRecordModelTests(unittest.TestCase):
+    def test_record_carries_required_fields(self) -> None:
+        record = ResearchSpendRecord(
+            request_id="request-1",
+            deliberation_id="deliberation-1",
+            category="research",
+            estimated_cost=5.0,
+            search_depth=1,
+            decision="approved",
+            reason="within research budget and caps",
+        )
+
+        self.assertEqual(record.request_id, "request-1")
+        self.assertEqual(record.deliberation_id, "deliberation-1")
+        self.assertEqual(record.category, "research")
+        self.assertEqual(record.estimated_cost, 5.0)
+        self.assertEqual(record.search_depth, 1)
+        self.assertEqual(record.decision, "approved")
+
+    def test_record_is_immutable(self) -> None:
+        record = ResearchSpendRecord(
+            request_id="request-1",
+            deliberation_id="deliberation-1",
+            category="research",
+            estimated_cost=5.0,
+            search_depth=1,
+            decision="approved",
+            reason="ok",
+        )
+
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            record.decision = "denied"  # type: ignore[misc]
+
+
+class ResearchSpendLedgerTests(unittest.TestCase):
+    def test_for_deliberation_filters_by_deliberation_id(self) -> None:
+        ledger = ResearchSpendLedger()
+        ledger.append(
+            ResearchSpendRecord(
+                request_id="r1", deliberation_id="d1", category="research",
+                estimated_cost=1.0, search_depth=1, decision="approved", reason="ok",
+            )
+        )
+        ledger.append(
+            ResearchSpendRecord(
+                request_id="r2", deliberation_id="d2", category="research",
+                estimated_cost=1.0, search_depth=1, decision="approved", reason="ok",
+            )
+        )
+
+        self.assertEqual([r.request_id for r in ledger.for_deliberation("d1")], ["r1"])
+
+    def test_approved_within_excludes_denied_and_out_of_window_entries(self) -> None:
+        ledger = ResearchSpendLedger()
+        now = datetime.now(timezone.utc)
+        ledger.append(
+            ResearchSpendRecord(
+                request_id="in-window", deliberation_id="d1", category="research",
+                estimated_cost=1.0, search_depth=1, decision="approved", reason="ok", timestamp=now,
+            )
+        )
+        ledger.append(
+            ResearchSpendRecord(
+                request_id="denied", deliberation_id="d1", category="research",
+                estimated_cost=1.0, search_depth=1, decision="denied", reason="no", timestamp=now,
+            )
+        )
+        ledger.append(
+            ResearchSpendRecord(
+                request_id="stale",
+                deliberation_id="d1",
+                category="research",
+                estimated_cost=1.0,
+                search_depth=1,
+                decision="approved",
+                reason="ok",
+                timestamp=now - timedelta(seconds=1000),
+            )
+        )
+
+        within = ledger.approved_within(now=now, window_seconds=100)
+
+        self.assertEqual([r.request_id for r in within], ["in-window"])
+
+
+class GovernorResearchSpendGateTests(unittest.TestCase):
+    def test_denies_when_no_constitution_configured(self) -> None:
+        kernel = Kernel()
+        governor = Governor(kernel)
+
+        denied: list[ResearchSpendDeniedEvent] = []
+        kernel.register_subscriber(EventType.RESEARCH_SPEND_DENIED, denied.append)
+        publish_research_spend_requested(kernel)
+
+        self.assertEqual(len(denied), 1)
+        self.assertEqual(denied[0].reason, "no constitution configured")
+
+    def test_denies_when_constitution_has_no_research_budget_rule(self) -> None:
+        kernel = Kernel()
+        governor = Governor(kernel)
+        governor.adopt_constitution(
+            Constitution(constitution_id="constitution-1", version=1, rules=("non_negative_costs",))
+        )
+
+        denied: list[ResearchSpendDeniedEvent] = []
+        kernel.register_subscriber(EventType.RESEARCH_SPEND_DENIED, denied.append)
+        publish_research_spend_requested(kernel)
+
+        self.assertEqual(len(denied), 1)
+        self.assertEqual(denied[0].reason, "no research policy configured")
+
+    def test_approves_request_within_budget_and_caps(self) -> None:
+        kernel = Kernel()
+        governor = Governor(kernel)
+        _adopt_research_constitution(governor, research_budget=50.0, max_searches_per_deliberation=5, max_search_depth=3)
+
+        approved: list[ResearchSpendApprovedEvent] = []
+        kernel.register_subscriber(EventType.RESEARCH_SPEND_APPROVED, approved.append)
+        publish_research_spend_requested(kernel, request_id="request-1", estimated_cost=5.0, search_depth=2)
+
+        self.assertEqual(len(approved), 1)
+        self.assertEqual(approved[0].request_id, "request-1")
+        self.assertEqual(approved[0].approved_cost, 5.0)
+        self.assertEqual(governor.research_spend_ledger.read_all()[-1].decision, "approved")
+
+    def test_denies_when_search_depth_exceeds_cap(self) -> None:
+        kernel = Kernel()
+        governor = Governor(kernel)
+        _adopt_research_constitution(governor, max_search_depth=3)
+
+        denied: list[ResearchSpendDeniedEvent] = []
+        kernel.register_subscriber(EventType.RESEARCH_SPEND_DENIED, denied.append)
+        publish_research_spend_requested(kernel, search_depth=4)
+
+        self.assertEqual(len(denied), 1)
+        self.assertIn("search_depth=4", denied[0].reason)
+        self.assertIn("exceeds limit=3", denied[0].reason)
+        self.assertEqual(governor.research_spend_ledger.read_all()[-1].decision, "denied")
+
+    def test_denies_when_deliberation_search_cap_exceeded(self) -> None:
+        kernel = Kernel()
+        governor = Governor(kernel)
+        _adopt_research_constitution(governor, max_searches_per_deliberation=2)
+
+        denied: list[ResearchSpendDeniedEvent] = []
+        kernel.register_subscriber(EventType.RESEARCH_SPEND_DENIED, denied.append)
+        publish_research_spend_requested(kernel, request_id="r1", deliberation_id="deliberation-x")
+        publish_research_spend_requested(kernel, request_id="r2", deliberation_id="deliberation-x")
+        publish_research_spend_requested(kernel, request_id="r3", deliberation_id="deliberation-x")
+
+        self.assertEqual(len(denied), 1)
+        self.assertIn("searches_this_deliberation=3", denied[0].reason)
+        self.assertIn("exceeds limit=2", denied[0].reason)
+
+    def test_different_deliberations_have_independent_search_counts(self) -> None:
+        kernel = Kernel()
+        governor = Governor(kernel)
+        _adopt_research_constitution(governor, max_searches_per_deliberation=1)
+
+        denied: list[ResearchSpendDeniedEvent] = []
+        approved: list[ResearchSpendApprovedEvent] = []
+        kernel.register_subscriber(EventType.RESEARCH_SPEND_DENIED, denied.append)
+        kernel.register_subscriber(EventType.RESEARCH_SPEND_APPROVED, approved.append)
+        publish_research_spend_requested(kernel, request_id="r1", deliberation_id="deliberation-a")
+        publish_research_spend_requested(kernel, request_id="r2", deliberation_id="deliberation-b")
+
+        self.assertEqual(len(approved), 2)
+        self.assertEqual(len(denied), 0)
+
+    def test_denies_when_rolling_window_budget_exhausted(self) -> None:
+        kernel = Kernel()
+        governor = Governor(kernel)
+        _adopt_research_constitution(governor, research_budget=10.0, window_seconds=3600.0, max_searches_per_deliberation=10)
+
+        denied: list[ResearchSpendDeniedEvent] = []
+        approved: list[ResearchSpendApprovedEvent] = []
+        kernel.register_subscriber(EventType.RESEARCH_SPEND_DENIED, denied.append)
+        kernel.register_subscriber(EventType.RESEARCH_SPEND_APPROVED, approved.append)
+
+        publish_research_spend_requested(kernel, request_id="r1", deliberation_id="d1", estimated_cost=6.0)
+        publish_research_spend_requested(kernel, request_id="r2", deliberation_id="d2", estimated_cost=6.0)
+
+        self.assertEqual(len(approved), 1)
+        self.assertEqual(len(denied), 1)
+        self.assertIn("exceeds research_budget=10.0", denied[0].reason)
+
+    def test_entries_outside_rolling_window_do_not_count_toward_budget(self) -> None:
+        kernel = Kernel()
+        governor = Governor(kernel)
+        _adopt_research_constitution(governor, research_budget=10.0, window_seconds=100.0, max_searches_per_deliberation=10)
+
+        # Simulate a previously-approved spend that has already aged out of
+        # the rolling window (Governor's own ledger, never Memory's).
+        governor.research_spend_ledger.append(
+            ResearchSpendRecord(
+                request_id="stale-request",
+                deliberation_id="d0",
+                category="research",
+                estimated_cost=9.0,
+                search_depth=1,
+                decision="approved",
+                reason="ok",
+                timestamp=datetime.now(timezone.utc) - timedelta(seconds=1000),
+            )
+        )
+
+        approved: list[ResearchSpendApprovedEvent] = []
+        kernel.register_subscriber(EventType.RESEARCH_SPEND_APPROVED, approved.append)
+        publish_research_spend_requested(kernel, request_id="fresh-request", estimated_cost=9.0)
+
+        self.assertEqual(len(approved), 1)
+
+    def test_default_window_used_when_rule_omits_window_argument(self) -> None:
+        kernel = Kernel()
+        governor = Governor(kernel)
+        governor.adopt_constitution(
+            Constitution(
+                constitution_id="constitution-1",
+                version=1,
+                rules=("research_budget:10", "max_searches_per_deliberation:5", "max_search_depth:3"),
+            )
+        )
+
+        approved: list[ResearchSpendApprovedEvent] = []
+        kernel.register_subscriber(EventType.RESEARCH_SPEND_APPROVED, approved.append)
+        publish_research_spend_requested(kernel, estimated_cost=5.0)
+
+        self.assertEqual(len(approved), 1)
+
+
+class GovernorResearchSpendSnapshotTests(unittest.TestCase):
+    def test_snapshot_restore_reconstructs_research_spend_ledger(self) -> None:
+        kernel = Kernel()
+        governor = Governor(kernel)
+        _adopt_research_constitution(governor, research_budget=10.0, max_searches_per_deliberation=5)
+
+        publish_research_spend_requested(kernel, request_id="r1", deliberation_id="d1", estimated_cost=5.0)
+        publish_research_spend_requested(kernel, request_id="r2", deliberation_id="d1", estimated_cost=20.0)
+        kernel.create_snapshot()
+
+        rebuilt_kernel = Kernel(event_log=kernel.event_log, snapshot_store=kernel.snapshot_store)
+        rebuilt_governor = Governor(rebuilt_kernel)
+        rebuilt_kernel.replay()
+
+        restored = {record.request_id: record for record in rebuilt_governor.research_spend_ledger.read_all()}
+        self.assertEqual(restored["r1"].decision, "approved")
+        self.assertEqual(restored["r2"].decision, "denied")
+        self.assertEqual(
+            [r.request_id for r in rebuilt_governor.research_spend_ledger.read_all()],
+            [r.request_id for r in governor.research_spend_ledger.read_all()],
         )
 
 

@@ -53,6 +53,9 @@ class EventType(str, Enum):
     KNOWLEDGE_APPLIED = "knowledge.applied"
     KNOWLEDGE_IGNORED = "knowledge.ignored"
     SENSOR_RELIABILITY_UPDATED = "sensor.reliability_updated"
+    RESEARCH_SPEND_REQUESTED = "research.spend_requested"
+    RESEARCH_SPEND_APPROVED = "research.spend_approved"
+    RESEARCH_SPEND_DENIED = "research.spend_denied"
     LEDGER_ENTRY_POSTED = "ledger.entry_posted"
     INFERENCE_REQUESTED = "inference.requested"
     INFERENCE_COMPLETED = "inference.completed"
@@ -530,6 +533,48 @@ class SensorReliabilityUpdatedEvent(Event):
 
 
 @dataclass(slots=True, kw_only=True)
+class ResearchSpendRequestedEvent(Event):
+    """Represents a request to spend against the research/information-acquisition budget.
+
+    Emitted by whatever future component needs to gate a research action
+    (e.g. Executive fulfilling a ResearchIntentEvent) against the Governor's
+    research budget and caps. Carries only a category, estimated cost, and
+    search depth for one deliberation — never a concrete event type — so
+    this gate is usable before ResearchIntentEvent itself exists.
+    """
+
+    request_id: str
+    deliberation_id: str
+    category: str
+    estimated_cost: float
+    search_depth: int
+    event_type: EventType = EventType.RESEARCH_SPEND_REQUESTED
+
+
+@dataclass(slots=True, kw_only=True)
+class ResearchSpendApprovedEvent(Event):
+    """Represents the Governor approving a research spend request."""
+
+    request_id: str
+    deliberation_id: str
+    category: str
+    approved_cost: float
+    reason: str
+    event_type: EventType = EventType.RESEARCH_SPEND_APPROVED
+
+
+@dataclass(slots=True, kw_only=True)
+class ResearchSpendDeniedEvent(Event):
+    """Represents the Governor denying a research spend request: budget exhausted, per-deliberation search cap, or search-depth cap."""
+
+    request_id: str
+    deliberation_id: str
+    category: str
+    reason: str
+    event_type: EventType = EventType.RESEARCH_SPEND_DENIED
+
+
+@dataclass(slots=True, kw_only=True)
 class LedgerEntryPostedEvent(Event):
     """Represents a financial ledger entry posted for an executed action."""
 
@@ -646,6 +691,9 @@ __all__ = [
     "KnowledgeAppliedEvent",
     "KnowledgeIgnoredEvent",
     "SensorReliabilityUpdatedEvent",
+    "ResearchSpendRequestedEvent",
+    "ResearchSpendApprovedEvent",
+    "ResearchSpendDeniedEvent",
     "LedgerEntryPostedEvent",
     "InferenceRequestedEvent",
     "InferenceCompletedEvent",

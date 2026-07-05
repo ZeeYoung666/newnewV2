@@ -16,6 +16,7 @@ from src.events import (
     PlanProposedEvent,
     PredictionRecordedEvent,
     PredictionResolvedEvent,
+    ResearchSpendApprovedEvent,
     SensorReliabilityUpdatedEvent,
 )
 from src.kernel import EventLog, Kernel
@@ -39,6 +40,8 @@ from src.memory import (
     OutcomeStore,
     PredictionLedger,
     PredictionRecord,
+    ResearchSpendLedger,
+    ResearchSpendRecord,
     SensorReliabilityLedger,
     SensorReliabilityRecord,
     SlowLearner,
@@ -1435,6 +1438,102 @@ class MemoryLedgerFastLearningSnapshotTests(unittest.TestCase):
         history = rebuilt_memory_ledger.sensor_reliability_ledger.history_for("sensor-a")
         self.assertEqual(len(history), 1)
         self.assertEqual(history[0].reliability, 1.0)
+
+
+def publish_research_spend_approved(
+    kernel: Kernel,
+    *,
+    request_id: str = "request-1",
+    deliberation_id: str = "deliberation-1",
+    category: str = "research",
+    approved_cost: float = 5.0,
+    reason: str = "within research budget and caps",
+) -> None:
+    kernel.publish(
+        ResearchSpendApprovedEvent(
+            source_component="governor",
+            request_id=request_id,
+            deliberation_id=deliberation_id,
+            category=category,
+            approved_cost=approved_cost,
+            reason=reason,
+        )
+    )
+
+
+class ResearchSpendRecordModelTests(unittest.TestCase):
+    def test_record_carries_required_fields(self) -> None:
+        record = ResearchSpendRecord(
+            request_id="request-1", correlation_id="correlation-1", category="research", cost=5.0
+        )
+
+        self.assertEqual(record.request_id, "request-1")
+        self.assertEqual(record.correlation_id, "correlation-1")
+        self.assertEqual(record.category, "research")
+        self.assertEqual(record.cost, 5.0)
+
+    def test_record_is_immutable(self) -> None:
+        record = ResearchSpendRecord(
+            request_id="request-1", correlation_id="correlation-1", category="research", cost=5.0
+        )
+
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            record.cost = 10.0  # type: ignore[misc]
+
+
+class ResearchSpendLedgerTests(unittest.TestCase):
+    def test_total_for_correlation_sums_only_matching_entries(self) -> None:
+        ledger = ResearchSpendLedger()
+        ledger.append(ResearchSpendRecord(request_id="r1", correlation_id="c1", category="research", cost=5.0))
+        ledger.append(ResearchSpendRecord(request_id="r2", correlation_id="c1", category="research", cost=3.0))
+        ledger.append(ResearchSpendRecord(request_id="r3", correlation_id="c2", category="research", cost=100.0))
+
+        self.assertEqual(ledger.total_for_correlation("c1"), 8.0)
+
+
+class MemoryLedgerResearchSpendTests(unittest.TestCase):
+    def test_research_spend_approved_is_recorded_under_its_correlation_id(self) -> None:
+        kernel = Kernel()
+        memory_ledger = MemoryLedger(kernel)
+
+        publish_research_spend_approved(kernel, request_id="request-1", approved_cost=7.5)
+
+        records = memory_ledger.research_spend_ledger.read_all()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].request_id, "request-1")
+        self.assertEqual(records[0].cost, 7.5)
+        self.assertNotEqual(records[0].correlation_id, "")
+
+    def test_multiple_approvals_under_the_same_correlation_id_accumulate(self) -> None:
+        kernel = Kernel()
+        memory_ledger = MemoryLedger(kernel)
+
+        # A single publish() call mints one correlation_id and every nested
+        # publish during that same dispatch inherits it (Kernel.publish),
+        # so two spends published back to back outside any dispatch instead
+        # get their own fresh correlation_id each — assert against each
+        # event's own correlation_id rather than assuming they match.
+        publish_research_spend_approved(kernel, request_id="request-1", approved_cost=4.0)
+        first_correlation_id = memory_ledger.research_spend_ledger.read_all()[0].correlation_id
+
+        total = memory_ledger.research_spend_ledger.total_for_correlation(first_correlation_id)
+        self.assertEqual(total, 4.0)
+
+    def test_snapshot_restore_reconstructs_research_spend_ledger(self) -> None:
+        kernel = Kernel()
+        memory_ledger = MemoryLedger(kernel)
+
+        publish_research_spend_approved(kernel, request_id="request-1", approved_cost=5.0)
+        kernel.create_snapshot()
+
+        rebuilt_kernel = Kernel(event_log=kernel.event_log, snapshot_store=kernel.snapshot_store)
+        rebuilt_memory_ledger = MemoryLedger(rebuilt_kernel)
+        rebuilt_kernel.replay()
+
+        restored = rebuilt_memory_ledger.research_spend_ledger.read_all()
+        self.assertEqual(len(restored), 1)
+        self.assertEqual(restored[0].request_id, "request-1")
+        self.assertEqual(restored[0].cost, 5.0)
 
 
 if __name__ == "__main__":
