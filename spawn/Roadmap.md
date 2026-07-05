@@ -55,7 +55,7 @@ gives Task #2 a direct query target: reconciling actuals means flipping
 these records, not silently trusting them as final. New tests added (rule
 breaches, budget window, snapshot round-trip, estimate-only marker); full
 suite green: 455 passed, 4 subtests passed. Commit: `c093b91` (core),
-`bc9cf16` (Charter.md tracked), plus the commit landing this note.
+`bc9cf16` (Charter.md tracked), `e67a682` (estimate_only marker).
 
 ## Deferred
 
