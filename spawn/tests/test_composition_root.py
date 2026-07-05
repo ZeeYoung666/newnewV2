@@ -45,8 +45,10 @@ class BuildOrganismTests(unittest.TestCase):
         }
 
         self.assertEqual(subscriber_counts.get(EventType.OBSERVATION_CREATED), 1)
-        self.assertEqual(subscriber_counts.get(EventType.BELIEF_CREATED), 1)
-        self.assertEqual(subscriber_counts.get(EventType.BELIEF_UPDATED), 1)
+        # World Model (belief confidence) and MemoryLedger (Fast Learning Loop
+        # sensor attribution) both react to a belief being created/updated.
+        self.assertEqual(subscriber_counts.get(EventType.BELIEF_CREATED), 2)
+        self.assertEqual(subscriber_counts.get(EventType.BELIEF_UPDATED), 2)
         # Governor (policy evaluation) and MemoryLedger (prediction recording)
         # both react to a proposed plan — the one deliberate fan-out in this wiring.
         self.assertEqual(subscriber_counts.get(EventType.PLAN_PROPOSED), 2)
@@ -56,10 +58,19 @@ class BuildOrganismTests(unittest.TestCase):
         # MemoryLedger (prediction resolution) and Executive (novelty index
         # over episodic history) both react to a recorded outcome.
         self.assertEqual(subscriber_counts.get(EventType.OUTCOME_RECORDED), 2)
+        # MemoryLedger (ledger append) and World Model (confidence weighting
+        # cache) both react to a sensor reliability update.
+        self.assertEqual(subscriber_counts.get(EventType.SENSOR_RELIABILITY_UPDATED), 2)
 
         # No event type should ever have more than one subscriber in this wiring,
         # except the deliberate fan-outs above.
-        multi_subscriber_event_types = {EventType.PLAN_PROPOSED, EventType.OUTCOME_RECORDED}
+        multi_subscriber_event_types = {
+            EventType.BELIEF_CREATED,
+            EventType.BELIEF_UPDATED,
+            EventType.PLAN_PROPOSED,
+            EventType.OUTCOME_RECORDED,
+            EventType.SENSOR_RELIABILITY_UPDATED,
+        }
         for event_type, count in subscriber_counts.items():
             if event_type in multi_subscriber_event_types:
                 continue
@@ -149,6 +160,7 @@ class BootstrapCycleTests(unittest.TestCase):
                 EventType.LEDGER_ENTRY_POSTED,
                 EventType.PREDICTION_RESOLVED,
                 EventType.LEARNING_ITERATION_STARTED,
+                EventType.SENSOR_RELIABILITY_UPDATED,
                 EventType.LEARNING_ITERATION_COMPLETED,
             ],
         )
@@ -161,7 +173,7 @@ class BootstrapCycleTests(unittest.TestCase):
         cascade = self.organism.kernel.event_log.read_from(start_sequence)
         correlation_ids = {event.correlation_id for _, event in cascade}
 
-        self.assertEqual(len(cascade), 28)
+        self.assertEqual(len(cascade), 29)
         self.assertEqual(len(correlation_ids), 1)
         self.assertIsNotNone(next(iter(correlation_ids)))
 
@@ -177,8 +189,8 @@ class BootstrapCycleTests(unittest.TestCase):
         first_ids = {event.correlation_id for event in first_cascade}
         second_ids = {event.correlation_id for event in second_cascade}
 
-        self.assertEqual(len(first_cascade), 28)
-        self.assertEqual(len(second_cascade), 28)
+        self.assertEqual(len(first_cascade), 29)
+        self.assertEqual(len(second_cascade), 29)
         self.assertEqual(len(first_ids), 1)
         self.assertEqual(len(second_ids), 1)
         self.assertNotEqual(first_ids, second_ids)

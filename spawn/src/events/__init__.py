@@ -50,6 +50,7 @@ class EventType(str, Enum):
     LEARNING_ITERATION_COMPLETED = "learning.iteration_completed"
     KNOWLEDGE_REVISION_STARTED = "knowledge.revision_started"
     KNOWLEDGE_REVISION_COMPLETED = "knowledge.revision_completed"
+    SENSOR_RELIABILITY_UPDATED = "sensor.reliability_updated"
     LEDGER_ENTRY_POSTED = "ledger.entry_posted"
     INFERENCE_REQUESTED = "inference.requested"
     INFERENCE_COMPLETED = "inference.completed"
@@ -489,6 +490,16 @@ class KnowledgeRevisionCompletedEvent(Event):
 
 
 @dataclass(slots=True, kw_only=True)
+class SensorReliabilityUpdatedEvent(Event):
+    """Represents the Fast Learning Loop revising one sensor's learned reliability."""
+
+    sensor_id: str
+    reliability: float
+    predictions_considered: int
+    event_type: EventType = EventType.SENSOR_RELIABILITY_UPDATED
+
+
+@dataclass(slots=True, kw_only=True)
 class LedgerEntryPostedEvent(Event):
     """Represents a financial ledger entry posted for an executed action."""
 
@@ -602,6 +613,7 @@ __all__ = [
     "LearningIterationCompletedEvent",
     "KnowledgeRevisionStartedEvent",
     "KnowledgeRevisionCompletedEvent",
+    "SensorReliabilityUpdatedEvent",
     "LedgerEntryPostedEvent",
     "InferenceRequestedEvent",
     "InferenceCompletedEvent",

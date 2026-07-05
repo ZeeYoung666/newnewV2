@@ -1,11 +1,28 @@
 import dataclasses
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from uuid import uuid4
 
-from src.events import BeliefCreatedEvent, BeliefUpdatedEvent, Event, EventType
-from src.kernel import Kernel
+from src.events import (
+    BeliefCreatedEvent,
+    BeliefUpdatedEvent,
+    Event,
+    EventType,
+    ObservationCreatedEvent,
+    SensorReliabilityUpdatedEvent,
+)
+from src.kernel import EventLog, Kernel
 from src.perception import Perception
-from src.world_model import Belief, BeliefStore, WorldModel
+from src.world_model import (
+    Belief,
+    BeliefStore,
+    DEFAULT_SENSOR_RELIABILITY,
+    SensorReliability,
+    SensorReliabilityStore,
+    WorldModel,
+)
 
 
 class BeliefModelTests(unittest.TestCase):
@@ -266,6 +283,180 @@ class WorldModelDecayTests(unittest.TestCase):
 
         self.assertEqual(world_model.belief_store.get("belief-1").confidence, 0.8)
         self.assertEqual(received, [])
+
+
+class SensorReliabilityModelTests(unittest.TestCase):
+    def test_carries_required_fields(self) -> None:
+        reliability = SensorReliability(sensor_id="sensor-1", reliability=0.75)
+
+        self.assertEqual(reliability.sensor_id, "sensor-1")
+        self.assertEqual(reliability.reliability, 0.75)
+
+    def test_is_immutable(self) -> None:
+        reliability = SensorReliability(sensor_id="sensor-1", reliability=0.75)
+
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            reliability.reliability = 0.1  # type: ignore[misc]
+
+
+class SensorReliabilityStoreTests(unittest.TestCase):
+    def test_unknown_sensor_returns_the_neutral_default(self) -> None:
+        store = SensorReliabilityStore()
+
+        self.assertEqual(store.get("unknown"), DEFAULT_SENSOR_RELIABILITY)
+        self.assertEqual(store.read_all(), [])
+
+    def test_put_and_get_round_trip(self) -> None:
+        store = SensorReliabilityStore()
+
+        store.put(SensorReliability(sensor_id="sensor-1", reliability=0.4))
+
+        self.assertEqual(store.get("sensor-1"), 0.4)
+        self.assertEqual(store.read_all(), [SensorReliability(sensor_id="sensor-1", reliability=0.4)])
+
+    def test_put_replaces_existing_reliability(self) -> None:
+        store = SensorReliabilityStore()
+
+        store.put(SensorReliability(sensor_id="sensor-1", reliability=0.4))
+        store.put(SensorReliability(sensor_id="sensor-1", reliability=0.9))
+
+        self.assertEqual(store.get("sensor-1"), 0.9)
+
+
+def publish_observation(
+    kernel: Kernel, *, sensor_id: str, normalized_value: float = 0.5, confidence: float = 0.8
+) -> None:
+    kernel.publish(
+        ObservationCreatedEvent(
+            source_component="perception",
+            observation_id=str(uuid4()),
+            sensor_id=sensor_id,
+            normalized_value=normalized_value,
+            confidence=confidence,
+            raw_source_type="test",
+        )
+    )
+
+
+def publish_sensor_reliability(kernel: Kernel, *, sensor_id: str, reliability: float) -> None:
+    kernel.publish(
+        SensorReliabilityUpdatedEvent(
+            source_component="memory_ledger",
+            sensor_id=sensor_id,
+            reliability=reliability,
+            predictions_considered=1,
+        )
+    )
+
+
+class WorldModelSensorReliabilityTests(unittest.TestCase):
+    def test_sensor_reliability_updated_event_only_mutates_the_cache_there(self) -> None:
+        kernel = Kernel()
+        world_model = WorldModel(kernel)
+
+        publish_sensor_reliability(kernel, sensor_id="sensor-1", reliability=0.3)
+
+        self.assertEqual(world_model.sensor_reliability_store.get("sensor-1"), 0.3)
+
+    def test_an_unscored_sensor_behaves_exactly_as_before_fast_learning(self) -> None:
+        kernel = Kernel()
+        world_model = WorldModel(kernel)
+
+        publish_observation(kernel, sensor_id="sensor-1", normalized_value=0.5, confidence=0.8)
+
+        self.assertEqual(world_model.belief_store.read_all()[0].confidence, 0.8)
+
+    def test_a_low_reliability_sensor_contributes_less_confidence_to_a_new_belief(self) -> None:
+        kernel = Kernel()
+        world_model = WorldModel(kernel)
+        publish_sensor_reliability(kernel, sensor_id="sensor-1", reliability=0.25)
+
+        publish_observation(kernel, sensor_id="sensor-1", normalized_value=0.5, confidence=0.8)
+
+        self.assertAlmostEqual(world_model.belief_store.read_all()[0].confidence, 0.8 * 0.25)
+
+    def test_reliable_sensors_contribute_more_confidence_than_unreliable_sensors(self) -> None:
+        kernel = Kernel()
+        world_model = WorldModel(kernel)
+        publish_sensor_reliability(kernel, sensor_id="reliable", reliability=0.9)
+        publish_sensor_reliability(kernel, sensor_id="unreliable", reliability=0.2)
+
+        publish_observation(kernel, sensor_id="reliable", normalized_value=0.5, confidence=0.8)
+        publish_observation(kernel, sensor_id="unreliable", normalized_value=0.5, confidence=0.8)
+
+        beliefs = {belief.provenance: belief for belief in world_model.belief_store.read_all()}
+        self.assertGreater(beliefs["reliable"].confidence, beliefs["unreliable"].confidence)
+
+    def test_confidence_changes_as_reliability_changes(self) -> None:
+        kernel = Kernel()
+        world_model = WorldModel(kernel)
+
+        publish_sensor_reliability(kernel, sensor_id="sensor-1", reliability=1.0)
+        publish_observation(kernel, sensor_id="sensor-1", normalized_value=0.5, confidence=0.8)
+        first_confidence = world_model.belief_store.get("sensor:sensor-1").confidence
+
+        publish_sensor_reliability(kernel, sensor_id="sensor-1", reliability=0.1)
+        publish_observation(kernel, sensor_id="sensor-1", normalized_value=0.5, confidence=0.8)
+        second_confidence = world_model.belief_store.get("sensor:sensor-1").confidence
+
+        self.assertLess(second_confidence, first_confidence)
+
+    def test_updated_belief_also_weights_incoming_evidence_by_reliability(self) -> None:
+        kernel = Kernel()
+        world_model = WorldModel(kernel)
+        publish_sensor_reliability(kernel, sensor_id="sensor-1", reliability=0.5)
+
+        publish_observation(kernel, sensor_id="sensor-1", normalized_value=0.4, confidence=0.6)
+        first = world_model.belief_store.get("sensor:sensor-1").confidence
+        self.assertAlmostEqual(first, 0.6 * 0.5)
+
+        publish_observation(kernel, sensor_id="sensor-1", normalized_value=0.5, confidence=1.0)
+        second = world_model.belief_store.get("sensor:sensor-1").confidence
+        self.assertAlmostEqual(second, (first + 1.0 * 0.5) / 2)
+
+
+class WorldModelSensorReliabilityReplayTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        self.log_path = Path(tmpdir.name) / "events.jsonl"
+
+    def test_replay_reconstructs_reliability(self) -> None:
+        event_log = EventLog(path=self.log_path)
+        kernel = Kernel(event_log=event_log)
+        world_model = WorldModel(kernel)
+
+        publish_sensor_reliability(kernel, sensor_id="sensor-1", reliability=0.3)
+        publish_observation(kernel, sensor_id="sensor-1", normalized_value=0.5, confidence=0.8)
+
+        rebuilt_kernel = Kernel(event_log=EventLog(path=self.log_path))
+        rebuilt_world_model = WorldModel(rebuilt_kernel)
+        rebuilt_kernel.replay()
+
+        self.assertEqual(rebuilt_world_model.sensor_reliability_store.get("sensor-1"), 0.3)
+        self.assertEqual(
+            rebuilt_world_model.belief_store.read_all(), world_model.belief_store.read_all()
+        )
+
+
+class WorldModelSensorReliabilitySnapshotTests(unittest.TestCase):
+    def test_snapshot_restore_reconstructs_reliability(self) -> None:
+        kernel = Kernel()
+        world_model = WorldModel(kernel)
+
+        publish_sensor_reliability(kernel, sensor_id="sensor-1", reliability=0.3)
+        kernel.create_snapshot()
+
+        rebuilt_kernel = Kernel(event_log=kernel.event_log, snapshot_store=kernel.snapshot_store)
+        rebuilt_world_model = WorldModel(rebuilt_kernel)
+        rebuilt_kernel.replay()
+
+        self.assertEqual(rebuilt_world_model.sensor_reliability_store.get("sensor-1"), 0.3)
+
+        # Confidence weighting must use the restored reliability, not the
+        # neutral default, for a fresh observation processed after restore.
+        publish_observation(rebuilt_kernel, sensor_id="sensor-1", normalized_value=0.5, confidence=0.8)
+        self.assertAlmostEqual(rebuilt_world_model.belief_store.get("sensor:sensor-1").confidence, 0.8 * 0.3)
 
 
 if __name__ == "__main__":

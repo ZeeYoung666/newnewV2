@@ -19,16 +19,20 @@ from uuid import uuid4
 from src.events import (
     ActionFailedEvent,
     ActionSucceededEvent,
+    BeliefCreatedEvent,
+    BeliefUpdatedEvent,
     EventType,
     KnowledgeRevisionCompletedEvent,
     KnowledgeRevisionStartedEvent,
     LearningIterationCompletedEvent,
     LearningIterationStartedEvent,
     LedgerEntryPostedEvent,
+    OpportunityIdentifiedEvent,
     OutcomeRecordedEvent,
     PlanProposedEvent,
     PredictionRecordedEvent,
     PredictionResolvedEvent,
+    SensorReliabilityUpdatedEvent,
 )
 from src.kernel import Kernel
 
@@ -342,6 +346,116 @@ class SlowLearner:
         )
 
 
+@dataclass(slots=True, kw_only=True, frozen=True)
+class SensorReliabilityRecord:
+    """An immutable audit trail entry for one sensor reliability update.
+
+    One record is appended per update — never mutated — mirroring
+    PredictionRecord's append-only shape; latest_for(sensor_id) on the
+    ledger is what recovers a sensor's current reliability.
+    """
+
+    sensor_id: str
+    reliability: float
+    predictions_considered: int
+    updated_at: datetime
+
+
+class SensorReliabilityLedger:
+    """Append-only log of sensor reliability updates.
+
+    A sensor_id can appear more than once (one update per resolved
+    prediction attributable to it) — read_all() returns every update ever
+    recorded, in order.
+    """
+
+    def __init__(self) -> None:
+        self._records: list[SensorReliabilityRecord] = []
+
+    def append(self, record: SensorReliabilityRecord) -> None:
+        self._records.append(record)
+
+    def read_all(self) -> list[SensorReliabilityRecord]:
+        return list(self._records)
+
+    def history_for(self, sensor_id: str) -> list[SensorReliabilityRecord]:
+        """All updates recorded for a single sensor, in order."""
+        return [record for record in self._records if record.sensor_id == sensor_id]
+
+    def latest_for(self, sensor_id: str) -> Optional[SensorReliabilityRecord]:
+        """The most recently recorded reliability for a sensor, or None if never updated."""
+        history = self.history_for(sensor_id)
+        return history[-1] if history else None
+
+
+class FastLearner:
+    """Deterministic, stateless computation for the Fast Learning Loop.
+
+    Owns no store of its own — MemoryLedger owns SensorReliabilityLedger.
+    Given the same resolved-prediction history attributable to a sensor,
+    this always returns the same reliability, which is what makes replay
+    and repeated runs over identical history produce identical scores.
+    """
+
+    DEFAULT_RELIABILITY = 1.0
+
+    def compute_reliability(self, resolved_predictions: list[PredictionRecord]) -> float:
+        """The fraction of resolved predictions that came true exactly as predicted.
+
+        Every resolved PredictionRecord's prediction_error is either 0.0 (the
+        plan succeeded, actual matched predicted) or negative (it failed),
+        so this reduces to a success rate over the predictions a sensor
+        contributed to. A sensor with no resolved history yet is trusted at
+        the neutral default rather than penalized for lack of evidence.
+        """
+        if not resolved_predictions:
+            return self.DEFAULT_RELIABILITY
+        accurate = sum(1 for record in resolved_predictions if record.prediction_error == 0.0)
+        return accurate / len(resolved_predictions)
+
+
+@dataclass(slots=True, kw_only=True, frozen=True)
+class BeliefSensorAttribution:
+    """Durable record of which sensor stands behind a belief_id.
+
+    Snapshots MemoryLedger's own `_sensor_for_belief` cache. Without this, a
+    belief_id learned before the latest snapshot would be forgotten on
+    restore (only events after the snapshot are replayed) and Task #31's
+    aggregation could later fold that same, still-live belief_id into a new
+    opportunity that Memory could no longer attribute to its sensor.
+    """
+
+    belief_id: str
+    sensor_id: str
+
+
+@dataclass(slots=True, kw_only=True, frozen=True)
+class OpportunitySensorAttribution:
+    """Durable record of which sensor(s) an opportunity aggregates.
+
+    Snapshots MemoryLedger's own `_sensors_for_opportunity` cache, for the
+    same reason as BeliefSensorAttribution.
+    """
+
+    opportunity_id: str
+    sensor_ids: tuple[str, ...]
+
+
+@dataclass(slots=True, kw_only=True, frozen=True)
+class PlanSensorAttribution:
+    """Durable record of which sensor(s) a plan's opportunity aggregates.
+
+    Snapshots MemoryLedger's own `_sensors_for_plan` cache: without this, a
+    plan proposed before the latest snapshot but resolved only after restore
+    (the same "left pending across a snapshot" shape PredictionLedger already
+    handles) would resolve with no sensor attribution at all, silently
+    dropping that resolution from the Fast Learning Loop.
+    """
+
+    plan_id: str
+    sensor_ids: tuple[str, ...]
+
+
 class MemoryLedger:
     """Records outcomes, episodic memory, and ledger entries for every executed action."""
 
@@ -357,7 +471,18 @@ class MemoryLedger:
         self.knowledge_ledger = KnowledgeLedger()
         self.long_term_knowledge_store = LongTermKnowledgeStore()
         self.slow_learner = SlowLearner()
+        self.sensor_reliability_ledger = SensorReliabilityLedger()
+        self.fast_learner = FastLearner()
         self._pending_predictions: dict[str, PredictionRecord] = {}
+        # Attribution chain built purely from published events (never reads
+        # World Model's or Executive's own stores) so the Fast Learning Loop
+        # can trace a resolved prediction back to the sensor(s) behind it.
+        self._sensor_for_belief: dict[str, str] = {}
+        self._sensors_for_opportunity: dict[str, tuple[str, ...]] = {}
+        self._sensors_for_plan: dict[str, tuple[str, ...]] = {}
+        kernel.register_subscriber(EventType.BELIEF_CREATED, self._on_belief_signal_for_reliability)
+        kernel.register_subscriber(EventType.BELIEF_UPDATED, self._on_belief_signal_for_reliability)
+        kernel.register_subscriber(EventType.OPPORTUNITY_IDENTIFIED, self._on_opportunity_identified_for_reliability)
         kernel.register_subscriber(EventType.ACTION_SUCCEEDED, self._on_action_succeeded)
         kernel.register_subscriber(EventType.ACTION_FAILED, self._on_action_failed)
         kernel.register_subscriber(EventType.PLAN_PROPOSED, self._on_plan_proposed)
@@ -368,6 +493,7 @@ class MemoryLedger:
         kernel.register_subscriber(EventType.LEARNING_ITERATION_COMPLETED, self._on_learning_iteration_completed)
         kernel.register_subscriber(EventType.KNOWLEDGE_REVISION_STARTED, self._on_knowledge_revision_started)
         kernel.register_subscriber(EventType.KNOWLEDGE_REVISION_COMPLETED, self._on_knowledge_revision_completed)
+        kernel.register_subscriber(EventType.SENSOR_RELIABILITY_UPDATED, self._on_sensor_reliability_updated)
         kernel.register_snapshot_source(
             "memory.outcomes", Outcome, self.outcome_store.read_all, self._restore_outcomes
         )
@@ -403,6 +529,30 @@ class MemoryLedger:
             LongTermKnowledge,
             self.long_term_knowledge_store.read_all,
             self._restore_long_term_knowledge,
+        )
+        kernel.register_snapshot_source(
+            "memory.sensor_reliability",
+            SensorReliabilityRecord,
+            self.sensor_reliability_ledger.read_all,
+            self._restore_sensor_reliability,
+        )
+        kernel.register_snapshot_source(
+            "memory.belief_sensor_attributions",
+            BeliefSensorAttribution,
+            self._capture_belief_sensor_attributions,
+            self._restore_belief_sensor_attributions,
+        )
+        kernel.register_snapshot_source(
+            "memory.opportunity_sensor_attributions",
+            OpportunitySensorAttribution,
+            self._capture_opportunity_sensor_attributions,
+            self._restore_opportunity_sensor_attributions,
+        )
+        kernel.register_snapshot_source(
+            "memory.plan_sensor_attributions",
+            PlanSensorAttribution,
+            self._capture_plan_sensor_attributions,
+            self._restore_plan_sensor_attributions,
         )
 
     def _restore_outcomes(self, outcomes: list[Outcome]) -> None:
@@ -443,6 +593,56 @@ class MemoryLedger:
         for entry in entries:
             self.long_term_knowledge_store.append(entry)
 
+    def _restore_sensor_reliability(self, records: list[SensorReliabilityRecord]) -> None:
+        for record in records:
+            self.sensor_reliability_ledger.append(record)
+
+    def _capture_belief_sensor_attributions(self) -> list[BeliefSensorAttribution]:
+        return [
+            BeliefSensorAttribution(belief_id=belief_id, sensor_id=sensor_id)
+            for belief_id, sensor_id in self._sensor_for_belief.items()
+        ]
+
+    def _restore_belief_sensor_attributions(self, records: list[BeliefSensorAttribution]) -> None:
+        for record in records:
+            self._sensor_for_belief[record.belief_id] = record.sensor_id
+
+    def _capture_opportunity_sensor_attributions(self) -> list[OpportunitySensorAttribution]:
+        return [
+            OpportunitySensorAttribution(opportunity_id=opportunity_id, sensor_ids=sensor_ids)
+            for opportunity_id, sensor_ids in self._sensors_for_opportunity.items()
+        ]
+
+    def _restore_opportunity_sensor_attributions(self, records: list[OpportunitySensorAttribution]) -> None:
+        for record in records:
+            self._sensors_for_opportunity[record.opportunity_id] = record.sensor_ids
+
+    def _capture_plan_sensor_attributions(self) -> list[PlanSensorAttribution]:
+        return [
+            PlanSensorAttribution(plan_id=plan_id, sensor_ids=sensor_ids)
+            for plan_id, sensor_ids in self._sensors_for_plan.items()
+        ]
+
+    def _restore_plan_sensor_attributions(self, records: list[PlanSensorAttribution]) -> None:
+        for record in records:
+            self._sensors_for_plan[record.plan_id] = record.sensor_ids
+
+    def _on_belief_signal_for_reliability(self, event: BeliefCreatedEvent | BeliefUpdatedEvent) -> None:
+        """Track which sensor stands behind each belief_id, via `provenance`
+        on the belief events World Model already publishes — never reads
+        World Model's belief store directly."""
+        self._sensor_for_belief[event.belief_id] = event.provenance
+
+    def _on_opportunity_identified_for_reliability(self, event: OpportunityIdentifiedEvent) -> None:
+        """Track which sensor(s) an opportunity aggregates, via the belief_ids
+        the Executive already publishes on OpportunityIdentifiedEvent — never
+        reads the Executive's opportunity store directly."""
+        self._sensors_for_opportunity[event.opportunity_id] = tuple(
+            self._sensor_for_belief[belief_id]
+            for belief_id in event.belief_ids
+            if belief_id in self._sensor_for_belief
+        )
+
     def _on_plan_proposed(self, event: PlanProposedEvent) -> None:
         """Record a prediction before execution: the plan's expected value.
 
@@ -451,6 +651,7 @@ class MemoryLedger:
         replay-correct. Whether the plan is ever approved or executed is
         unknown at this point; an unmatched prediction simply stays pending.
         """
+        self._sensors_for_plan[event.plan_id] = self._sensors_for_opportunity.get(event.opportunity_id, ())
         self._kernel.publish(
             PredictionRecordedEvent(
                 source_component="memory_ledger",
@@ -524,6 +725,35 @@ class MemoryLedger:
                 source_component="memory_ledger",
                 iteration_id=str(uuid4()),
                 predictions_considered=len(resolved_predictions),
+            )
+        )
+
+        # Every newly resolved prediction is also one tick of the Fast
+        # Learning Loop for each sensor behind it: publishing here (rather
+        # than mutating the ledger directly) is what keeps it replay-correct.
+        for sensor_id in self._sensors_for_plan.get(event.plan_id, ()):
+            sensor_resolved = [
+                record
+                for record in resolved_predictions
+                if sensor_id in self._sensors_for_plan.get(record.plan_id, ())
+            ]
+            reliability = self.fast_learner.compute_reliability(sensor_resolved)
+            self._kernel.publish(
+                SensorReliabilityUpdatedEvent(
+                    source_component="memory_ledger",
+                    sensor_id=sensor_id,
+                    reliability=reliability,
+                    predictions_considered=len(sensor_resolved),
+                )
+            )
+
+    def _on_sensor_reliability_updated(self, event: SensorReliabilityUpdatedEvent) -> None:
+        self.sensor_reliability_ledger.append(
+            SensorReliabilityRecord(
+                sensor_id=event.sensor_id,
+                reliability=event.reliability,
+                predictions_considered=event.predictions_considered,
+                updated_at=event.timestamp,
             )
         )
 
@@ -717,5 +947,11 @@ __all__ = [
     "PredictionLedger",
     "LearningLedger",
     "MediumLearner",
+    "SensorReliabilityRecord",
+    "SensorReliabilityLedger",
+    "FastLearner",
+    "BeliefSensorAttribution",
+    "OpportunitySensorAttribution",
+    "PlanSensorAttribution",
     "MemoryLedger",
 ]

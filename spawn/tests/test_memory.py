@@ -5,20 +5,24 @@ from datetime import datetime, timezone
 from src.events import (
     ActionFailedEvent,
     ActionSucceededEvent,
+    BeliefCreatedEvent,
     Event,
     EventType,
     KnowledgeRevisionCompletedEvent,
     KnowledgeRevisionStartedEvent,
     LearningIterationCompletedEvent,
     LearningIterationStartedEvent,
+    OpportunityIdentifiedEvent,
     PlanProposedEvent,
     PredictionRecordedEvent,
     PredictionResolvedEvent,
+    SensorReliabilityUpdatedEvent,
 )
 from src.kernel import EventLog, Kernel
 from src.memory import (
     EpisodicMemoryEntry,
     EpisodicMemoryStore,
+    FastLearner,
     FinancialLedger,
     Heuristic,
     HeuristicStore,
@@ -35,6 +39,8 @@ from src.memory import (
     OutcomeStore,
     PredictionLedger,
     PredictionRecord,
+    SensorReliabilityLedger,
+    SensorReliabilityRecord,
     SlowLearner,
 )
 
@@ -1127,6 +1133,293 @@ class MemoryLedgerSlowLearningSnapshotTests(unittest.TestCase):
         restored_knowledge = rebuilt_memory_ledger.long_term_knowledge_store.read_all()
         self.assertEqual(len(restored_knowledge), 1)
         self.assertEqual(restored_knowledge, memory_ledger.long_term_knowledge_store.read_all())
+
+
+class SensorReliabilityRecordModelTests(unittest.TestCase):
+    def test_record_carries_required_fields(self) -> None:
+        now = datetime.now(timezone.utc)
+        record = SensorReliabilityRecord(
+            sensor_id="sensor-1", reliability=0.8, predictions_considered=5, updated_at=now
+        )
+
+        self.assertEqual(record.sensor_id, "sensor-1")
+        self.assertEqual(record.reliability, 0.8)
+        self.assertEqual(record.predictions_considered, 5)
+        self.assertEqual(record.updated_at, now)
+
+    def test_record_is_immutable(self) -> None:
+        record = SensorReliabilityRecord(
+            sensor_id="sensor-1", reliability=0.8, predictions_considered=5, updated_at=datetime.now(timezone.utc)
+        )
+
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            record.reliability = 0.5  # type: ignore[misc]
+
+
+class SensorReliabilityLedgerTests(unittest.TestCase):
+    def test_append_read_all_history_for_and_latest_for(self) -> None:
+        ledger = SensorReliabilityLedger()
+        first = SensorReliabilityRecord(
+            sensor_id="sensor-1", reliability=1.0, predictions_considered=1, updated_at=datetime.now(timezone.utc)
+        )
+        second = SensorReliabilityRecord(
+            sensor_id="sensor-1", reliability=0.5, predictions_considered=2, updated_at=datetime.now(timezone.utc)
+        )
+
+        ledger.append(first)
+        ledger.append(second)
+
+        self.assertEqual(ledger.read_all(), [first, second])
+        self.assertEqual(ledger.history_for("sensor-1"), [first, second])
+        self.assertEqual(ledger.history_for("no-such-sensor"), [])
+        self.assertEqual(ledger.latest_for("sensor-1"), second)
+        self.assertIsNone(ledger.latest_for("no-such-sensor"))
+
+    def test_ledger_has_no_mutation_methods_other_than_append(self) -> None:
+        ledger = SensorReliabilityLedger()
+
+        self.assertFalse(hasattr(ledger, "update"))
+        self.assertFalse(hasattr(ledger, "remove"))
+        self.assertFalse(hasattr(ledger, "clear"))
+
+
+class FastLearnerTests(unittest.TestCase):
+    def test_compute_reliability_is_the_success_rate(self) -> None:
+        learner = FastLearner()
+        predictions = [
+            _prediction_record(predicted_value=100.0, actual_value=100.0, plan_id="a"),
+            _prediction_record(predicted_value=100.0, actual_value=0.0, plan_id="b"),
+            _prediction_record(predicted_value=50.0, actual_value=50.0, plan_id="c"),
+        ]
+
+        self.assertAlmostEqual(learner.compute_reliability(predictions), 2 / 3)
+
+    def test_compute_reliability_with_no_history_is_the_neutral_default(self) -> None:
+        learner = FastLearner()
+
+        self.assertEqual(learner.compute_reliability([]), FastLearner.DEFAULT_RELIABILITY)
+
+    def test_compute_reliability_is_deterministic_for_identical_history(self) -> None:
+        learner = FastLearner()
+        history_a = [
+            _prediction_record(predicted_value=60.0, actual_value=60.0, plan_id="a"),
+            _prediction_record(predicted_value=40.0, actual_value=0.0, plan_id="b"),
+        ]
+        history_b = [
+            _prediction_record(predicted_value=60.0, actual_value=60.0, plan_id="a"),
+            _prediction_record(predicted_value=40.0, actual_value=0.0, plan_id="b"),
+        ]
+
+        self.assertEqual(learner.compute_reliability(history_a), learner.compute_reliability(history_b))
+
+
+def publish_belief_created(kernel: Kernel, *, belief_id: str, sensor_id: str, confidence: float = 0.6) -> None:
+    kernel.publish(
+        BeliefCreatedEvent(
+            source_component="world_model",
+            belief_id=belief_id,
+            claim="claim",
+            confidence=confidence,
+            provenance=sensor_id,
+        )
+    )
+
+
+def publish_opportunity_identified(
+    kernel: Kernel, *, opportunity_id: str, belief_ids: tuple[str, ...], confidence: float = 0.6
+) -> None:
+    kernel.publish(
+        OpportunityIdentifiedEvent(
+            source_component="executive",
+            opportunity_id=opportunity_id,
+            belief_ids=belief_ids,
+            confidence=confidence,
+        )
+    )
+
+
+def _resolve_one_prediction(
+    kernel: Kernel,
+    *,
+    sensor_id: str,
+    belief_id: str = "belief-1",
+    opportunity_id: str = "opportunity-1",
+    plan_id: str = "plan-1",
+    success: bool = True,
+    expected_value: float = 60.0,
+) -> None:
+    """Drive one belief -> opportunity -> plan -> outcome cascade for a single
+    sensor, entirely through published events — the same sanctioned path
+    MemoryLedger uses to attribute a resolved prediction back to its sensor.
+    """
+    publish_belief_created(kernel, belief_id=belief_id, sensor_id=sensor_id)
+    publish_opportunity_identified(kernel, opportunity_id=opportunity_id, belief_ids=(belief_id,))
+    publish_plan_proposed(kernel, plan_id=plan_id, opportunity_id=opportunity_id, expected_value=expected_value)
+    if success:
+        publish_action_succeeded(kernel, action_id=f"action-{plan_id}", plan_id=plan_id)
+    else:
+        publish_action_failed(kernel, action_id=f"action-{plan_id}", plan_id=plan_id)
+
+
+class MemoryLedgerFastLearningIntegrationTests(unittest.TestCase):
+    def test_resolved_prediction_triggers_a_sensor_reliability_update(self) -> None:
+        kernel = Kernel()
+        memory_ledger = MemoryLedger(kernel)
+        updated: list[Event] = []
+        kernel.register_subscriber(EventType.SENSOR_RELIABILITY_UPDATED, updated.append)
+
+        _resolve_one_prediction(kernel, sensor_id="sensor-a", success=True)
+
+        self.assertEqual(len(updated), 1)
+        self.assertIsInstance(updated[0], SensorReliabilityUpdatedEvent)
+        self.assertEqual(updated[0].sensor_id, "sensor-a")
+        self.assertEqual(updated[0].reliability, 1.0)
+        self.assertEqual(updated[0].predictions_considered, 1)
+
+        history = memory_ledger.sensor_reliability_ledger.history_for("sensor-a")
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0].reliability, 1.0)
+
+    def test_each_sensor_develops_an_independent_reliability_score(self) -> None:
+        kernel = Kernel()
+        memory_ledger = MemoryLedger(kernel)
+
+        _resolve_one_prediction(
+            kernel, sensor_id="sensor-a", belief_id="belief-a", opportunity_id="opp-a", plan_id="plan-a",
+            success=True,
+        )
+        _resolve_one_prediction(
+            kernel, sensor_id="sensor-b", belief_id="belief-b", opportunity_id="opp-b", plan_id="plan-b",
+            success=False,
+        )
+
+        self.assertEqual(memory_ledger.sensor_reliability_ledger.latest_for("sensor-a").reliability, 1.0)
+        self.assertEqual(memory_ledger.sensor_reliability_ledger.latest_for("sensor-b").reliability, 0.0)
+
+    def test_reliability_is_recomputed_as_more_predictions_resolve(self) -> None:
+        kernel = Kernel()
+        memory_ledger = MemoryLedger(kernel)
+
+        _resolve_one_prediction(
+            kernel, sensor_id="sensor-a", belief_id="belief-a1", opportunity_id="opp-a1", plan_id="plan-a1",
+            success=True,
+        )
+        self.assertEqual(memory_ledger.sensor_reliability_ledger.latest_for("sensor-a").reliability, 1.0)
+
+        _resolve_one_prediction(
+            kernel, sensor_id="sensor-a", belief_id="belief-a2", opportunity_id="opp-a2", plan_id="plan-a2",
+            success=False,
+        )
+        self.assertEqual(memory_ledger.sensor_reliability_ledger.latest_for("sensor-a").reliability, 0.5)
+
+    def test_a_shared_opportunity_attributes_resolution_to_every_contributing_sensor(self) -> None:
+        # An opportunity aggregated from beliefs contributed by two different
+        # sensors (Task #31's aggregation) means both sensors share credit or
+        # blame when that shared prediction resolves.
+        kernel = Kernel()
+        memory_ledger = MemoryLedger(kernel)
+
+        publish_belief_created(kernel, belief_id="belief-a", sensor_id="sensor-a")
+        publish_belief_created(kernel, belief_id="belief-b", sensor_id="sensor-b")
+        publish_opportunity_identified(kernel, opportunity_id="opp-shared", belief_ids=("belief-a", "belief-b"))
+        publish_plan_proposed(kernel, plan_id="plan-shared", opportunity_id="opp-shared", expected_value=60.0)
+        publish_action_succeeded(kernel, action_id="action-shared", plan_id="plan-shared")
+
+        self.assertEqual(memory_ledger.sensor_reliability_ledger.latest_for("sensor-a").reliability, 1.0)
+        self.assertEqual(memory_ledger.sensor_reliability_ledger.latest_for("sensor-b").reliability, 1.0)
+
+
+class MemoryLedgerFastLearningReplayTests(unittest.TestCase):
+    def test_replay_reconstructs_reliability(self) -> None:
+        event_log = EventLog()
+        kernel = Kernel(event_log=event_log)
+        memory_ledger = MemoryLedger(kernel)
+
+        _resolve_one_prediction(
+            kernel, sensor_id="sensor-a", belief_id="belief-a1", opportunity_id="opp-a1", plan_id="plan-a1",
+            success=True,
+        )
+        _resolve_one_prediction(
+            kernel, sensor_id="sensor-a", belief_id="belief-a2", opportunity_id="opp-a2", plan_id="plan-a2",
+            success=False,
+        )
+
+        rebuilt_kernel = Kernel(event_log=event_log)
+        rebuilt_memory_ledger = MemoryLedger(rebuilt_kernel)
+        rebuilt_kernel.replay()
+
+        self.assertEqual(
+            rebuilt_memory_ledger.sensor_reliability_ledger.read_all(),
+            memory_ledger.sensor_reliability_ledger.read_all(),
+        )
+        self.assertEqual(rebuilt_memory_ledger.sensor_reliability_ledger.latest_for("sensor-a").reliability, 0.5)
+
+
+class MemoryLedgerFastLearningSnapshotTests(unittest.TestCase):
+    def test_snapshot_restore_reconstructs_reliability(self) -> None:
+        kernel = Kernel()
+        memory_ledger = MemoryLedger(kernel)
+
+        _resolve_one_prediction(
+            kernel, sensor_id="sensor-a", belief_id="belief-a1", opportunity_id="opp-a1", plan_id="plan-a1",
+            success=True,
+        )
+        kernel.create_snapshot()
+
+        rebuilt_kernel = Kernel(event_log=kernel.event_log, snapshot_store=kernel.snapshot_store)
+        rebuilt_memory_ledger = MemoryLedger(rebuilt_kernel)
+        rebuilt_kernel.replay()
+
+        restored = rebuilt_memory_ledger.sensor_reliability_ledger.read_all()
+        self.assertEqual(len(restored), 1)
+        self.assertEqual(restored, memory_ledger.sensor_reliability_ledger.read_all())
+        self.assertEqual(rebuilt_memory_ledger.sensor_reliability_ledger.latest_for("sensor-a").reliability, 1.0)
+
+    def test_a_belief_attributed_before_the_snapshot_still_attributes_after_restore(self) -> None:
+        # A belief_id learned (BELIEF_CREATED -> sensor) before the snapshot
+        # boundary must still resolve to its sensor when that SAME still-live
+        # belief_id is later folded into a brand new opportunity after
+        # restore (Task #31's aggregation can do exactly this) — otherwise
+        # the sensor silently drops out of the Fast Learning Loop.
+        kernel = Kernel()
+        memory_ledger = MemoryLedger(kernel)
+
+        publish_belief_created(kernel, belief_id="belief-a", sensor_id="sensor-a")
+        kernel.create_snapshot()
+
+        rebuilt_kernel = Kernel(event_log=kernel.event_log, snapshot_store=kernel.snapshot_store)
+        rebuilt_memory_ledger = MemoryLedger(rebuilt_kernel)
+        rebuilt_kernel.replay()
+
+        publish_opportunity_identified(rebuilt_kernel, opportunity_id="opp-later", belief_ids=("belief-a",))
+        publish_plan_proposed(rebuilt_kernel, plan_id="plan-later", opportunity_id="opp-later", expected_value=60.0)
+        publish_action_succeeded(rebuilt_kernel, action_id="action-later", plan_id="plan-later")
+
+        history = rebuilt_memory_ledger.sensor_reliability_ledger.history_for("sensor-a")
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0].reliability, 1.0)
+
+    def test_a_plan_left_pending_across_the_snapshot_still_attributes_after_restore(self) -> None:
+        # Mirrors PredictionLedger's own "plan-2 left pending across a
+        # snapshot" shape: the plan's sensor attribution must also survive
+        # so its later resolution still updates the right sensor.
+        kernel = Kernel()
+        memory_ledger = MemoryLedger(kernel)
+
+        publish_belief_created(kernel, belief_id="belief-a", sensor_id="sensor-a")
+        publish_opportunity_identified(kernel, opportunity_id="opp-a", belief_ids=("belief-a",))
+        publish_plan_proposed(kernel, plan_id="plan-a", opportunity_id="opp-a", expected_value=60.0)
+        kernel.create_snapshot()
+
+        rebuilt_kernel = Kernel(event_log=kernel.event_log, snapshot_store=kernel.snapshot_store)
+        rebuilt_memory_ledger = MemoryLedger(rebuilt_kernel)
+        rebuilt_kernel.replay()
+
+        publish_action_succeeded(rebuilt_kernel, action_id="action-a", plan_id="plan-a")
+
+        history = rebuilt_memory_ledger.sensor_reliability_ledger.history_for("sensor-a")
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0].reliability, 1.0)
 
 
 if __name__ == "__main__":
