@@ -88,7 +88,7 @@ triggering event — a random id would differ from the one already baked
 into the historical `ResearchSpendApprovedEvent`/`DeniedEvent`, breaking
 the correlation lookup on replay. New tests added (cold start, gate
 approve/deny, soft stop, priority ranking, replay determinism); full suite
-green: 466 passed, 4 subtests passed. Commit: pending.
+green: 466 passed, 4 subtests passed. Commit: `681c63d`.
 
 **Ambiguity resolved, not guessed**: cold-start seed queries, their fixed
 priorities, and the soft-stop window/threshold numbers are stated
