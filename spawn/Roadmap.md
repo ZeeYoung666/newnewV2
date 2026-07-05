@@ -49,8 +49,7 @@ Memory & Ledger's store); Memory & Ledger separately records approved
 research spend per `correlation_id` from `ResearchSpendApprovedEvent`, so a
 later EV computation can net out acquisition cost. New tests added (rule
 breaches, budget window, snapshot round-trip); full suite green: 453
-passed, 4 subtests passed. Commit: pending (recorded in a follow-up commit
-once this lands).
+passed, 4 subtests passed. Commit: `c093b91`.
 
 ## Deferred
 
