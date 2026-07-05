@@ -1008,6 +1008,16 @@ class SlowLearnerTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertIn("3", first)
 
+    def test_classify_negative_mean_error_is_anti_pattern(self) -> None:
+        learner = SlowLearner()
+
+        self.assertEqual(learner.classify(-4.5), "anti_pattern")
+
+    def test_classify_zero_mean_error_is_playbook(self) -> None:
+        learner = SlowLearner()
+
+        self.assertEqual(learner.classify(0.0), "playbook")
+
 
 class MemoryLedgerSlowLearningIntegrationTests(unittest.TestCase):
     def _run_cycles(self, kernel: Kernel, count: int) -> None:
@@ -1040,6 +1050,11 @@ class MemoryLedgerSlowLearningIntegrationTests(unittest.TestCase):
         knowledge = memory_ledger.long_term_knowledge_store.read_all()
         self.assertEqual(len(knowledge), 1)
         self.assertEqual(knowledge[0].knowledge_id, completed[0].knowledge_id)
+        # Every action in _run_cycles succeeds, so mean_prediction_error is
+        # always 0.0 and the distilled knowledge classifies as a playbook.
+        self.assertEqual(completed[0].knowledge_type, "playbook")
+        self.assertEqual(knowledge[0].knowledge_type, "playbook")
+        self.assertEqual(knowledge[0].summary, completed[0].summary)
 
     def test_revisions_are_append_only_and_multiple_revisions_preserve_history(self) -> None:
         kernel = Kernel()

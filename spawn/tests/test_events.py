@@ -24,6 +24,8 @@ from src.events import (
     ExecutiveDecisionEvent,
     InferenceCompletedEvent,
     InferenceRequestedEvent,
+    KnowledgeAppliedEvent,
+    KnowledgeIgnoredEvent,
     KnowledgeRevisionCompletedEvent,
     KnowledgeRevisionStartedEvent,
     LearningIterationCompletedEvent,
@@ -210,6 +212,7 @@ class EventModelTests(unittest.TestCase):
             source_component="memory_ledger",
             revision_id="revision-1",
             heuristics_considered=3,
+            mean_prediction_error=0.0,
         )
         knowledge_revision_completed_event = KnowledgeRevisionCompletedEvent(
             source_component="memory_ledger",
@@ -217,6 +220,25 @@ class EventModelTests(unittest.TestCase):
             heuristics_considered=3,
             consensus_confidence=0.42,
             knowledge_id="knowledge-1",
+            knowledge_type="playbook",
+            summary="knowledge consolidation: consensus confidence 0.420000 over 3 heuristics",
+        )
+        knowledge_applied_event = KnowledgeAppliedEvent(
+            source_component="governor",
+            application_id="application-1",
+            knowledge_id="knowledge-1",
+            knowledge_type="playbook",
+            plan_id="plan-1",
+            decision="support",
+            reason="playbook knowledge-1 applied",
+        )
+        knowledge_ignored_event = KnowledgeIgnoredEvent(
+            source_component="governor",
+            application_id="application-2",
+            knowledge_id="knowledge-2",
+            knowledge_type="anti_pattern",
+            plan_id="plan-1",
+            reason="anti-pattern knowledge-2 below confidence threshold, not enforced",
         )
         execution_event = ActionAttemptedEvent(
             source_component="executor",
@@ -323,6 +345,8 @@ class EventModelTests(unittest.TestCase):
         self.assertEqual(learning_iteration_completed_event.event_type, EventType.LEARNING_ITERATION_COMPLETED)
         self.assertEqual(knowledge_revision_started_event.event_type, EventType.KNOWLEDGE_REVISION_STARTED)
         self.assertEqual(knowledge_revision_completed_event.event_type, EventType.KNOWLEDGE_REVISION_COMPLETED)
+        self.assertEqual(knowledge_applied_event.event_type, EventType.KNOWLEDGE_APPLIED)
+        self.assertEqual(knowledge_ignored_event.event_type, EventType.KNOWLEDGE_IGNORED)
         self.assertEqual(policy_evaluated_event.event_type, EventType.POLICY_EVALUATED)
         self.assertEqual(budget_checked_event.event_type, EventType.BUDGET_CHECKED)
         self.assertEqual(execution_event.event_type, EventType.ACTION_ATTEMPTED)

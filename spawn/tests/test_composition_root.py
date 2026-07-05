@@ -61,6 +61,9 @@ class BuildOrganismTests(unittest.TestCase):
         # MemoryLedger (ledger append) and World Model (confidence weighting
         # cache) both react to a sensor reliability update.
         self.assertEqual(subscriber_counts.get(EventType.SENSOR_RELIABILITY_UPDATED), 2)
+        # MemoryLedger (long-term knowledge store) and Governor (KnowledgeAdvisor)
+        # both react to a completed Slow Learning Loop knowledge revision.
+        self.assertEqual(subscriber_counts.get(EventType.KNOWLEDGE_REVISION_COMPLETED), 2)
 
         # No event type should ever have more than one subscriber in this wiring,
         # except the deliberate fan-outs above.
@@ -70,6 +73,7 @@ class BuildOrganismTests(unittest.TestCase):
             EventType.PLAN_PROPOSED,
             EventType.OUTCOME_RECORDED,
             EventType.SENSOR_RELIABILITY_UPDATED,
+            EventType.KNOWLEDGE_REVISION_COMPLETED,
         }
         for event_type, count in subscriber_counts.items():
             if event_type in multi_subscriber_event_types:

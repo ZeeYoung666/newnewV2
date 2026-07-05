@@ -14,10 +14,15 @@ from src.events import (
     EscalationResolvedEvent,
     Event,
     EventType,
+    KnowledgeAppliedEvent,
+    KnowledgeIgnoredEvent,
+    KnowledgeRevisionCompletedEvent,
     PlanProposedEvent,
     PolicyEvaluatedEvent,
 )
 from src.governor import (
+    ANTI_PATTERN_CONFIDENCE_THRESHOLD,
+    PLAYBOOK_CONFIDENCE_THRESHOLD,
     Amendment,
     AmendmentLog,
     ApprovalLog,
@@ -29,6 +34,10 @@ from src.governor import (
     EscalationRecord,
     EscalationStore,
     Governor,
+    KnowledgeAdvisor,
+    KnowledgeApplicationLedger,
+    KnowledgeApplicationRecord,
+    LearnedKnowledge,
     RuleRegistry,
 )
 from src.kernel import EventLog, Kernel
@@ -54,6 +63,29 @@ def publish_plan_proposed(
             attention_cost=attention_cost,
             capital_cost=capital_cost,
             ordered_actions=ordered_actions,
+        )
+    )
+
+
+def publish_knowledge_revision_completed(
+    kernel: Kernel,
+    *,
+    revision_id: str = "revision-1",
+    heuristics_considered: int = 3,
+    consensus_confidence: float = 0.9,
+    knowledge_id: str,
+    knowledge_type: str,
+    summary: str = "test knowledge",
+) -> None:
+    kernel.publish(
+        KnowledgeRevisionCompletedEvent(
+            source_component="memory_ledger",
+            revision_id=revision_id,
+            heuristics_considered=heuristics_considered,
+            consensus_confidence=consensus_confidence,
+            knowledge_id=knowledge_id,
+            knowledge_type=knowledge_type,
+            summary=summary,
         )
     )
 
@@ -1006,6 +1038,428 @@ class GovernorEscalationSnapshotTests(unittest.TestCase):
         self.assertEqual(restored[still_pending_id].status, "pending")
         self.assertIn(still_pending_id, rebuilt_governor._pending_escalations)
         self.assertNotIn(resolved_id, rebuilt_governor._pending_escalations)
+
+
+class KnowledgeApplicationRecordModelTests(unittest.TestCase):
+    def test_record_carries_required_fields(self) -> None:
+        record = KnowledgeApplicationRecord(
+            application_id="application-1",
+            knowledge_id="knowledge-1",
+            knowledge_type="playbook",
+            plan_id="plan-1",
+            applied=True,
+            reason="playbook knowledge-1 applied",
+        )
+
+        self.assertEqual(record.application_id, "application-1")
+        self.assertEqual(record.knowledge_id, "knowledge-1")
+        self.assertEqual(record.knowledge_type, "playbook")
+        self.assertEqual(record.plan_id, "plan-1")
+        self.assertTrue(record.applied)
+        self.assertEqual(record.reason, "playbook knowledge-1 applied")
+
+    def test_record_is_immutable(self) -> None:
+        record = KnowledgeApplicationRecord(
+            application_id="application-1",
+            knowledge_id="knowledge-1",
+            knowledge_type="playbook",
+            plan_id="plan-1",
+            applied=True,
+            reason="ok",
+        )
+
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            record.applied = False  # type: ignore[misc]
+
+
+class KnowledgeApplicationLedgerTests(unittest.TestCase):
+    def test_append_read_all_and_history_for(self) -> None:
+        ledger = KnowledgeApplicationLedger()
+        first = KnowledgeApplicationRecord(
+            application_id="application-1",
+            knowledge_id="knowledge-1",
+            knowledge_type="playbook",
+            plan_id="plan-1",
+            applied=True,
+            reason="ok",
+        )
+        second = KnowledgeApplicationRecord(
+            application_id="application-2",
+            knowledge_id="knowledge-2",
+            knowledge_type="anti_pattern",
+            plan_id="plan-2",
+            applied=False,
+            reason="below threshold",
+        )
+
+        ledger.append(first)
+        ledger.append(second)
+
+        self.assertEqual(ledger.read_all(), [first, second])
+        self.assertEqual(ledger.history_for("plan-1"), [first])
+        self.assertEqual(ledger.history_for("plan-2"), [second])
+        self.assertEqual(ledger.history_for("no-such-plan"), [])
+
+    def test_ledger_has_no_mutation_methods_other_than_append(self) -> None:
+        ledger = KnowledgeApplicationLedger()
+
+        self.assertFalse(hasattr(ledger, "update"))
+        self.assertFalse(hasattr(ledger, "remove"))
+        self.assertFalse(hasattr(ledger, "clear"))
+
+
+class KnowledgeAdvisorTests(unittest.TestCase):
+    def test_record_classifies_by_knowledge_type(self) -> None:
+        advisor = KnowledgeAdvisor()
+        playbook = LearnedKnowledge(
+            knowledge_id="knowledge-1",
+            knowledge_type="playbook",
+            summary="playbook summary",
+            consensus_confidence=0.9,
+            heuristics_considered=3,
+            learned_at=datetime.now(timezone.utc),
+        )
+        anti_pattern = LearnedKnowledge(
+            knowledge_id="knowledge-2",
+            knowledge_type="anti_pattern",
+            summary="anti-pattern summary",
+            consensus_confidence=0.9,
+            heuristics_considered=3,
+            learned_at=datetime.now(timezone.utc),
+        )
+
+        advisor.record(playbook)
+        advisor.record(anti_pattern)
+
+        self.assertEqual(advisor.playbooks(), [playbook])
+        self.assertEqual(advisor.anti_patterns(), [anti_pattern])
+        self.assertEqual(set(advisor.read_all()), {playbook, anti_pattern})
+
+
+class GovernorKnowledgeStateTests(unittest.TestCase):
+    def test_knowledge_revision_completed_updates_governor_knowledge_state(self) -> None:
+        kernel = Kernel()
+        governor = Governor(kernel)
+
+        publish_knowledge_revision_completed(
+            kernel,
+            knowledge_id="knowledge-playbook-1",
+            knowledge_type="playbook",
+            consensus_confidence=0.8,
+            summary="repeated successes distilled into a playbook",
+        )
+
+        playbooks = governor.knowledge_advisor.playbooks()
+        self.assertEqual(len(playbooks), 1)
+        self.assertEqual(playbooks[0].knowledge_id, "knowledge-playbook-1")
+        self.assertEqual(playbooks[0].knowledge_type, "playbook")
+        self.assertEqual(playbooks[0].consensus_confidence, 0.8)
+        self.assertEqual(playbooks[0].summary, "repeated successes distilled into a playbook")
+        self.assertEqual(governor.knowledge_advisor.anti_patterns(), [])
+
+    def test_knowledge_revision_completed_never_reads_memory_store(self) -> None:
+        # The Governor's KnowledgeAdvisor is populated exclusively from the
+        # event's own fields; Governor carries no reference to Memory at all.
+        kernel = Kernel()
+        governor = Governor(kernel)
+
+        self.assertFalse(hasattr(governor, "memory_ledger"))
+        self.assertFalse(hasattr(governor, "long_term_knowledge_store"))
+
+
+class GovernorKnowledgeInfluenceTests(unittest.TestCase):
+    def _configured_governor(self, kernel: Kernel) -> Governor:
+        governor = Governor(kernel)
+        governor.adopt_constitution(
+            Constitution(constitution_id="constitution-1", version=1, rules=("non_negative_costs",))
+        )
+        governor.fund_budget(
+            BudgetState(budget_id="budget-1", available_attention=10.0, available_capital=100.0)
+        )
+        return governor
+
+    def test_learned_playbook_influences_approval_decision(self) -> None:
+        kernel = Kernel()
+        governor = self._configured_governor(kernel)
+        applied: list[Event] = []
+        granted: list[Event] = []
+        kernel.register_subscriber(EventType.KNOWLEDGE_APPLIED, applied.append)
+        kernel.register_subscriber(EventType.APPROVAL_GRANTED, granted.append)
+
+        publish_knowledge_revision_completed(
+            kernel,
+            knowledge_id="knowledge-playbook-1",
+            knowledge_type="playbook",
+            consensus_confidence=PLAYBOOK_CONFIDENCE_THRESHOLD,
+            summary="proven procedure",
+        )
+        publish_plan_proposed(kernel, plan_id="plan-1", attention_cost=1.0, capital_cost=6.0)
+
+        self.assertEqual(len(granted), 1)
+        self.assertIsInstance(granted[0], ApprovalGrantedEvent)
+        self.assertIn("playbook knowledge-playbook-1 applied", granted[0].reason)
+
+        self.assertEqual(len(applied), 1)
+        self.assertIsInstance(applied[0], KnowledgeAppliedEvent)
+        self.assertEqual(applied[0].knowledge_id, "knowledge-playbook-1")
+        self.assertEqual(applied[0].knowledge_type, "playbook")
+        self.assertEqual(applied[0].decision, "support")
+        self.assertEqual(applied[0].plan_id, "plan-1")
+
+        history = governor.knowledge_application_ledger.history_for("plan-1")
+        self.assertEqual(len(history), 1)
+        self.assertTrue(history[0].applied)
+        self.assertEqual(history[0].knowledge_id, "knowledge-playbook-1")
+
+    def test_low_confidence_playbook_is_ignored_not_applied(self) -> None:
+        kernel = Kernel()
+        governor = self._configured_governor(kernel)
+        ignored: list[Event] = []
+        granted: list[Event] = []
+        kernel.register_subscriber(EventType.KNOWLEDGE_IGNORED, ignored.append)
+        kernel.register_subscriber(EventType.APPROVAL_GRANTED, granted.append)
+
+        publish_knowledge_revision_completed(
+            kernel,
+            knowledge_id="knowledge-playbook-1",
+            knowledge_type="playbook",
+            consensus_confidence=PLAYBOOK_CONFIDENCE_THRESHOLD - 0.1,
+        )
+        publish_plan_proposed(kernel, plan_id="plan-1", attention_cost=1.0, capital_cost=6.0)
+
+        self.assertEqual(len(granted), 1)
+        self.assertEqual(granted[0].reason, "within policy and budget")
+
+        self.assertEqual(len(ignored), 1)
+        self.assertIsInstance(ignored[0], KnowledgeIgnoredEvent)
+        history = governor.knowledge_application_ledger.history_for("plan-1")
+        self.assertEqual(len(history), 1)
+        self.assertFalse(history[0].applied)
+
+    def test_learned_anti_pattern_influences_approval_decision(self) -> None:
+        kernel = Kernel()
+        governor = self._configured_governor(kernel)
+        applied: list[Event] = []
+        denied: list[Event] = []
+        granted: list[Event] = []
+        kernel.register_subscriber(EventType.KNOWLEDGE_APPLIED, applied.append)
+        kernel.register_subscriber(EventType.APPROVAL_DENIED, denied.append)
+        kernel.register_subscriber(EventType.APPROVAL_GRANTED, granted.append)
+
+        # Before the anti-pattern is learned, this exact plan shape is approved.
+        publish_plan_proposed(kernel, plan_id="plan-1", attention_cost=1.0, capital_cost=6.0)
+        self.assertEqual(len(granted), 1)
+
+        publish_knowledge_revision_completed(
+            kernel,
+            knowledge_id="knowledge-anti-1",
+            knowledge_type="anti_pattern",
+            consensus_confidence=ANTI_PATTERN_CONFIDENCE_THRESHOLD,
+            summary="repeated failure pattern",
+        )
+
+        # Same plan shape, proposed again after the anti-pattern was learned,
+        # is now vetoed even though it still satisfies policy and budget.
+        publish_plan_proposed(kernel, plan_id="plan-2", attention_cost=1.0, capital_cost=6.0)
+
+        self.assertEqual(len(granted), 1)  # unchanged: no second approval
+        self.assertEqual(len(denied), 1)
+        self.assertIsInstance(denied[0], ApprovalDeniedEvent)
+        self.assertEqual(denied[0].plan_id, "plan-2")
+        self.assertIn("anti-pattern knowledge-anti-1 enforced", denied[0].reason)
+
+        self.assertEqual(len(applied), 1)
+        self.assertEqual(applied[0].decision, "deny")
+        self.assertEqual(applied[0].knowledge_type, "anti_pattern")
+
+        records = governor.approval_log.read_all()
+        self.assertEqual(records[-1].decision, "rejected")
+        # Budget was never touched by the vetoed plan.
+        budget = governor.budget_store.get("budget-1")
+        self.assertEqual(budget.available_capital, 94.0)  # only plan-1's spend
+
+    def test_low_confidence_anti_pattern_does_not_veto(self) -> None:
+        kernel = Kernel()
+        governor = self._configured_governor(kernel)
+        granted: list[Event] = []
+        kernel.register_subscriber(EventType.APPROVAL_GRANTED, granted.append)
+
+        publish_knowledge_revision_completed(
+            kernel,
+            knowledge_id="knowledge-anti-1",
+            knowledge_type="anti_pattern",
+            consensus_confidence=ANTI_PATTERN_CONFIDENCE_THRESHOLD - 0.1,
+        )
+        publish_plan_proposed(kernel, plan_id="plan-1", attention_cost=1.0, capital_cost=6.0)
+
+        self.assertEqual(len(granted), 1)
+        history = governor.knowledge_application_ledger.history_for("plan-1")
+        self.assertEqual(len(history), 1)
+        self.assertFalse(history[0].applied)
+
+    def test_constitution_overrides_conflicting_learned_knowledge(self) -> None:
+        kernel = Kernel()
+        governor = self._configured_governor(kernel)
+        denied: list[Event] = []
+        kernel.register_subscriber(EventType.APPROVAL_DENIED, denied.append)
+
+        # A high-confidence playbook is on record, but this plan violates the
+        # Constitution outright (negative capital_cost). The playbook must
+        # not rescue it.
+        publish_knowledge_revision_completed(
+            kernel,
+            knowledge_id="knowledge-playbook-1",
+            knowledge_type="playbook",
+            consensus_confidence=0.99,
+        )
+        publish_plan_proposed(kernel, plan_id="plan-1", capital_cost=-1.0)
+
+        self.assertEqual(len(denied), 1)
+        self.assertIn("non_negative_costs", denied[0].reason)
+        self.assertNotIn("playbook", denied[0].reason)
+
+        # Knowledge is only ever consulted once policy and budget already
+        # passed, so a constitution-denied plan never reaches the knowledge
+        # gate at all.
+        self.assertEqual(governor.knowledge_application_ledger.history_for("plan-1"), [])
+
+    def test_constitution_overrides_even_with_anti_pattern_present(self) -> None:
+        kernel = Kernel()
+        governor = self._configured_governor(kernel)
+        denied: list[Event] = []
+        kernel.register_subscriber(EventType.APPROVAL_DENIED, denied.append)
+
+        publish_knowledge_revision_completed(
+            kernel,
+            knowledge_id="knowledge-anti-1",
+            knowledge_type="anti_pattern",
+            consensus_confidence=0.99,
+        )
+        publish_plan_proposed(kernel, plan_id="plan-1", capital_cost=-1.0)
+
+        self.assertEqual(len(denied), 1)
+        self.assertIn("non_negative_costs", denied[0].reason)
+        self.assertNotIn("anti-pattern", denied[0].reason)
+        self.assertEqual(governor.knowledge_application_ledger.history_for("plan-1"), [])
+
+
+class KnowledgeApplicationLedgerAppendOnlyTests(unittest.TestCase):
+    def test_application_history_accumulates_across_plans_without_mutation(self) -> None:
+        kernel = Kernel()
+        governor = Governor(kernel)
+        governor.adopt_constitution(
+            Constitution(constitution_id="constitution-1", version=1, rules=("non_negative_costs",))
+        )
+        governor.fund_budget(
+            BudgetState(budget_id="budget-1", available_attention=100.0, available_capital=1000.0)
+        )
+        publish_knowledge_revision_completed(
+            kernel,
+            knowledge_id="knowledge-playbook-1",
+            knowledge_type="playbook",
+            consensus_confidence=PLAYBOOK_CONFIDENCE_THRESHOLD,
+        )
+
+        publish_plan_proposed(kernel, plan_id="plan-1", attention_cost=1.0, capital_cost=6.0)
+        publish_plan_proposed(kernel, plan_id="plan-2", attention_cost=1.0, capital_cost=6.0)
+
+        all_records = governor.knowledge_application_ledger.read_all()
+        self.assertEqual(len(all_records), 2)
+        self.assertEqual([record.plan_id for record in all_records], ["plan-1", "plan-2"])
+        # Earlier plans' records are untouched by later ones.
+        self.assertEqual(governor.knowledge_application_ledger.history_for("plan-1")[0].plan_id, "plan-1")
+        self.assertEqual(governor.knowledge_application_ledger.history_for("plan-2")[0].plan_id, "plan-2")
+
+
+class GovernorKnowledgeReplayTests(unittest.TestCase):
+    def test_replay_reconstructs_knowledge_state_and_application_history(self) -> None:
+        event_log = EventLog()
+        kernel = Kernel(event_log=event_log)
+        governor = Governor(kernel)
+        governor.adopt_constitution(
+            Constitution(constitution_id="constitution-1", version=1, rules=("non_negative_costs",))
+        )
+        governor.fund_budget(
+            BudgetState(budget_id="budget-1", available_attention=10.0, available_capital=100.0)
+        )
+
+        publish_plan_proposed(kernel, plan_id="plan-1", attention_cost=1.0, capital_cost=6.0)
+        publish_knowledge_revision_completed(
+            kernel,
+            knowledge_id="knowledge-anti-1",
+            knowledge_type="anti_pattern",
+            consensus_confidence=ANTI_PATTERN_CONFIDENCE_THRESHOLD,
+        )
+        publish_plan_proposed(kernel, plan_id="plan-2", attention_cost=1.0, capital_cost=6.0)
+
+        rebuilt_kernel = Kernel(event_log=event_log)
+        rebuilt_governor = Governor(rebuilt_kernel)
+        rebuilt_governor.adopt_constitution(
+            Constitution(constitution_id="constitution-1", version=1, rules=("non_negative_costs",))
+        )
+        rebuilt_governor.fund_budget(
+            BudgetState(budget_id="budget-1", available_attention=10.0, available_capital=100.0)
+        )
+        rebuilt_kernel.replay()
+
+        self.assertEqual(
+            rebuilt_governor.knowledge_advisor.anti_patterns(), governor.knowledge_advisor.anti_patterns()
+        )
+        self.assertEqual(rebuilt_governor.knowledge_advisor.playbooks(), governor.knowledge_advisor.playbooks())
+
+        # application_id is minted fresh at decision time (like approval_id),
+        # so replay reproduces the same decisions but not the same IDs —
+        # compare the meaningful fields instead, same precedent as the
+        # existing approval-decision replay test above.
+        def _application_shape(record: KnowledgeApplicationRecord) -> tuple[str, str, str, bool, str]:
+            return (record.knowledge_id, record.knowledge_type, record.plan_id, record.applied, record.reason)
+
+        self.assertEqual(
+            [_application_shape(record) for record in rebuilt_governor.knowledge_application_ledger.read_all()],
+            [_application_shape(record) for record in governor.knowledge_application_ledger.read_all()],
+        )
+        self.assertEqual(
+            [record.decision for record in rebuilt_governor.approval_log.read_all()],
+            [record.decision for record in governor.approval_log.read_all()],
+        )
+        self.assertEqual(rebuilt_governor.approval_log.read_all()[-1].decision, "rejected")
+
+
+class GovernorKnowledgeSnapshotTests(unittest.TestCase):
+    def test_snapshot_restore_reconstructs_knowledge_state(self) -> None:
+        kernel = Kernel()
+        governor = Governor(kernel)
+        governor.adopt_constitution(
+            Constitution(constitution_id="constitution-1", version=1, rules=("non_negative_costs",))
+        )
+        governor.fund_budget(
+            BudgetState(budget_id="budget-1", available_attention=10.0, available_capital=100.0)
+        )
+
+        publish_knowledge_revision_completed(
+            kernel,
+            knowledge_id="knowledge-playbook-1",
+            knowledge_type="playbook",
+            consensus_confidence=PLAYBOOK_CONFIDENCE_THRESHOLD,
+        )
+        publish_plan_proposed(kernel, plan_id="plan-1", attention_cost=1.0, capital_cost=6.0)
+        kernel.create_snapshot()
+
+        rebuilt_kernel = Kernel(event_log=kernel.event_log, snapshot_store=kernel.snapshot_store)
+        rebuilt_governor = Governor(rebuilt_kernel)
+        rebuilt_kernel.replay()
+
+        restored_playbooks = {k.knowledge_id: k for k in rebuilt_governor.knowledge_advisor.playbooks()}
+        self.assertIn("knowledge-playbook-1", restored_playbooks)
+        self.assertEqual(restored_playbooks["knowledge-playbook-1"].consensus_confidence, PLAYBOOK_CONFIDENCE_THRESHOLD)
+
+        restored_applications = rebuilt_governor.knowledge_application_ledger.read_all()
+        self.assertEqual(len(restored_applications), 1)
+        self.assertEqual(restored_applications[0].plan_id, "plan-1")
+        self.assertEqual(
+            restored_applications,
+            governor.knowledge_application_ledger.read_all(),
+        )
 
 
 if __name__ == "__main__":
