@@ -56,6 +56,7 @@ class EventType(str, Enum):
     RESEARCH_SPEND_REQUESTED = "research.spend_requested"
     RESEARCH_SPEND_APPROVED = "research.spend_approved"
     RESEARCH_SPEND_DENIED = "research.spend_denied"
+    RESEARCH_INTENT_EMITTED = "research.intent_emitted"
     LEDGER_ENTRY_POSTED = "ledger.entry_posted"
     INFERENCE_REQUESTED = "inference.requested"
     INFERENCE_COMPLETED = "inference.completed"
@@ -575,6 +576,28 @@ class ResearchSpendDeniedEvent(Event):
 
 
 @dataclass(slots=True, kw_only=True)
+class ResearchIntentEvent(Event):
+    """Represents the Executive's intent to research a query.
+
+    Schema owned by the Executive (Task #1) — this is the concrete event
+    Task #0's spend gate deliberately stayed blind to, so it is only ever
+    emitted after the matching ResearchSpendRequestedEvent has already been
+    approved (request_id links the two). Perception (Task #2) is the sole
+    future consumer; it turns this into an actual search and a
+    ResearchObservationEvent. Perception never invents its own research
+    directions — the Executive is the only place this event originates.
+    """
+
+    request_id: str
+    query: str
+    estimated_cost: float
+    search_depth: int
+    priority: int
+    rationale: str
+    event_type: EventType = EventType.RESEARCH_INTENT_EMITTED
+
+
+@dataclass(slots=True, kw_only=True)
 class LedgerEntryPostedEvent(Event):
     """Represents a financial ledger entry posted for an executed action."""
 
@@ -694,6 +717,7 @@ __all__ = [
     "ResearchSpendRequestedEvent",
     "ResearchSpendApprovedEvent",
     "ResearchSpendDeniedEvent",
+    "ResearchIntentEvent",
     "LedgerEntryPostedEvent",
     "InferenceRequestedEvent",
     "InferenceCompletedEvent",

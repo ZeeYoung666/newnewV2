@@ -64,6 +64,10 @@ class BuildOrganismTests(unittest.TestCase):
         # MemoryLedger (long-term knowledge store) and Governor (KnowledgeAdvisor)
         # both react to a completed Slow Learning Loop knowledge revision.
         self.assertEqual(subscriber_counts.get(EventType.KNOWLEDGE_REVISION_COMPLETED), 2)
+        # MemoryLedger (research spend ledger, keyed by correlation_id) and
+        # Executive (resolves its own pending research intent, then emits
+        # ResearchIntentEvent) both react to a granted research spend.
+        self.assertEqual(subscriber_counts.get(EventType.RESEARCH_SPEND_APPROVED), 2)
 
         # No event type should ever have more than one subscriber in this wiring,
         # except the deliberate fan-outs above.
@@ -74,6 +78,7 @@ class BuildOrganismTests(unittest.TestCase):
             EventType.OUTCOME_RECORDED,
             EventType.SENSOR_RELIABILITY_UPDATED,
             EventType.KNOWLEDGE_REVISION_COMPLETED,
+            EventType.RESEARCH_SPEND_APPROVED,
         }
         for event_type, count in subscriber_counts.items():
             if event_type in multi_subscriber_event_types:

@@ -20,8 +20,15 @@ from src.events import (
     OutcomeRecordedEvent,
     PlanAbandonedEvent,
     PlanProposedEvent,
+    ResearchIntentEvent,
+    ResearchSpendApprovedEvent,
+    ResearchSpendDeniedEvent,
+    ResearchSpendRequestedEvent,
 )
 from src.executive import (
+    COLD_START_SEED_QUERIES,
+    SOFT_STOP_MIN_NOVEL_RATE,
+    SOFT_STOP_WINDOW_SEARCHES,
     DecisionRecord,
     DecisionRecordStore,
     Executive,
@@ -35,8 +42,12 @@ from src.executive import (
     OpportunityGroupStore,
     OpportunityStore,
     Plan,
+    PendingResearchIntent,
     PlanStore,
+    ResearchCandidate,
+    ResearchSoftStopState,
 )
+from src.governor import BudgetState, Constitution, Governor
 from src.inference import (
     InferencePort,
     InferenceProvider,
@@ -46,6 +57,39 @@ from src.inference import (
     ProviderRegistry,
 )
 from src.kernel import EventLog, Kernel
+
+
+def _make_executive_with_governor(
+    *,
+    research_budget: float = 50.0,
+    max_searches_per_deliberation: int = 5,
+    max_search_depth: int = 3,
+    provider: InferenceProvider | None = None,
+) -> tuple[Kernel, Executive, Governor]:
+    """Build an unstarted Kernel with both Executive and Governor wired, the
+    latter pre-configured with a research policy, so research spend requests
+    can actually be gated end to end. Caller controls when kernel.start()
+    runs so tests can seed beliefs beforehand to suppress cold start.
+    """
+    kernel = Kernel()
+    registry = ProviderRegistry()
+    registry.register("provider", provider if provider is not None else MockInferenceProvider())
+    registry.set_active("provider")
+    port = InferencePort(kernel, registry)
+    executive = Executive(kernel, inference_port=port)
+    governor = Governor(kernel)
+    governor.adopt_constitution(
+        Constitution(
+            constitution_id="constitution-1",
+            version=1,
+            rules=(
+                f"research_budget:{research_budget},86400",
+                f"max_searches_per_deliberation:{max_searches_per_deliberation}",
+                f"max_search_depth:{max_search_depth}",
+            ),
+        )
+    )
+    return kernel, executive, governor
 
 
 class ScriptedInferenceProvider(InferenceProvider):
@@ -1223,6 +1267,264 @@ class OpportunityGenerationSnapshotTests(unittest.TestCase):
         ]
         self.assertEqual(len(rejected), 1)
         self.assertIn("duplicate", rejected[0].reason)
+
+
+class ResearchCandidateModelTests(unittest.TestCase):
+    def test_candidate_carries_required_fields(self) -> None:
+        candidate = ResearchCandidate(
+            query="q", estimated_cost=5.0, search_depth=1, priority=3, rationale="r", deliberation_id="d"
+        )
+
+        self.assertEqual(candidate.query, "q")
+        self.assertEqual(candidate.priority, 3)
+
+    def test_candidate_is_immutable(self) -> None:
+        candidate = ResearchCandidate(
+            query="q", estimated_cost=5.0, search_depth=1, priority=3, rationale="r", deliberation_id="d"
+        )
+
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            candidate.priority = 9  # type: ignore[misc]
+
+
+class ExecutiveColdStartResearchTests(unittest.TestCase):
+    def test_cold_start_emits_a_research_intent_for_every_seed_query(self) -> None:
+        kernel, executive, governor = _make_executive_with_governor()
+        governor.fund_budget(BudgetState(budget_id="b1", available_attention=100.0, available_capital=1000.0))
+
+        emitted: list[ResearchIntentEvent] = []
+        kernel.register_subscriber(EventType.RESEARCH_INTENT_EMITTED, emitted.append)
+        kernel.start()
+
+        self.assertEqual(len(emitted), len(COLD_START_SEED_QUERIES))
+        emitted_queries = {event.query for event in emitted}
+        self.assertEqual(emitted_queries, {query for query, _priority in COLD_START_SEED_QUERIES})
+
+    def test_cold_start_seeding_is_recorded_exactly_once(self) -> None:
+        kernel, executive, governor = _make_executive_with_governor()
+        governor.fund_budget(BudgetState(budget_id="b1", available_attention=100.0, available_capital=1000.0))
+        kernel.start()
+
+        seeded_records = [
+            record
+            for record in executive.decision_record_store.read_all()
+            if record.decision_type == "cold_start_research_seeded"
+        ]
+        self.assertEqual(len(seeded_records), 1)
+
+    def test_cold_start_skipped_when_beliefs_already_exist(self) -> None:
+        kernel, executive, governor = _make_executive_with_governor()
+        governor.fund_budget(BudgetState(budget_id="b1", available_attention=100.0, available_capital=1000.0))
+        _publish_belief(kernel, "belief-a", 0.9)
+
+        emitted: list[ResearchIntentEvent] = []
+        kernel.register_subscriber(EventType.RESEARCH_INTENT_EMITTED, emitted.append)
+        kernel.start()
+
+        self.assertEqual(emitted, [])
+        self.assertEqual(
+            [
+                record
+                for record in executive.decision_record_store.read_all()
+                if record.decision_type == "cold_start_research_seeded"
+            ],
+            [],
+        )
+
+    def test_cold_start_does_not_double_seed_across_replay(self) -> None:
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        log_path = Path(tmpdir.name) / "events.jsonl"
+
+        def _boot() -> tuple[Kernel, Executive, Governor]:
+            kernel = Kernel(event_log=EventLog(path=log_path))
+            registry = ProviderRegistry()
+            registry.register("mock", MockInferenceProvider())
+            registry.set_active("mock")
+            executive = Executive(kernel, inference_port=InferencePort(kernel, registry))
+            governor = Governor(kernel)
+            governor.adopt_constitution(
+                Constitution(
+                    constitution_id="constitution-1",
+                    version=1,
+                    rules=("research_budget:50,86400", "max_searches_per_deliberation:5", "max_search_depth:3"),
+                )
+            )
+            governor.fund_budget(BudgetState(budget_id="b1", available_attention=100.0, available_capital=1000.0))
+            return kernel, executive, governor
+
+        kernel, executive, governor = _boot()
+        kernel.start()
+        kernel.stop()
+
+        rebuilt_kernel, rebuilt_executive, rebuilt_governor = _boot()
+        rebuilt_kernel.replay()
+
+        original_emitted = [
+            record
+            for record in executive.decision_record_store.read_all()
+            if record.decision_type == "research_intent_emitted"
+        ]
+        rebuilt_emitted = [
+            record
+            for record in rebuilt_executive.decision_record_store.read_all()
+            if record.decision_type == "research_intent_emitted"
+        ]
+        self.assertEqual(len(original_emitted), len(COLD_START_SEED_QUERIES))
+        self.assertEqual(len(rebuilt_emitted), len(COLD_START_SEED_QUERIES))
+        seeded_count = lambda records: sum(  # noqa: E731
+            1 for r in records if r.decision_type == "cold_start_research_seeded"
+        )
+        self.assertEqual(
+            seeded_count(executive.decision_record_store.read_all()),
+            seeded_count(rebuilt_executive.decision_record_store.read_all()),
+        )
+
+
+class ExecutiveResearchGateTests(unittest.TestCase):
+    def test_denied_request_records_decision_and_never_emits_intent(self) -> None:
+        kernel = Kernel()
+        registry = ProviderRegistry()
+        registry.register("mock", MockInferenceProvider())
+        registry.set_active("mock")
+        executive = Executive(kernel, inference_port=InferencePort(kernel, registry))
+        Governor(kernel)  # no constitution adopted at all -> hard deny
+        kernel.start()
+
+        emitted: list[ResearchIntentEvent] = []
+        kernel.register_subscriber(EventType.RESEARCH_INTENT_EMITTED, emitted.append)
+
+        request_id = executive.request_research(
+            query="some query", estimated_cost=5.0, search_depth=1, priority=1,
+            rationale="test", deliberation_id="d1",
+        )
+        kernel.run_until_idle()
+
+        # Cold start also fired (no beliefs, no constitution) and denied its
+        # own 3 seed requests, so filter to this call's own request_id rather
+        # than asserting a total count.
+        self.assertIsNotNone(request_id)
+        self.assertEqual(emitted, [])
+        denied_records = [
+            r
+            for r in executive.decision_record_store.read_all()
+            if r.decision_type == "research_intent_denied" and r.subject_id == request_id
+        ]
+        self.assertEqual(len(denied_records), 1)
+        self.assertIn("no constitution configured", denied_records[0].rationale)
+
+    def test_approved_request_emits_intent_with_expected_fields(self) -> None:
+        kernel, executive, governor = _make_executive_with_governor()
+        governor.fund_budget(BudgetState(budget_id="b1", available_attention=100.0, available_capital=1000.0))
+        _publish_belief(kernel, "belief-a", 0.9)  # suppress cold start, keep this test isolated
+        kernel.start()
+
+        emitted: list[ResearchIntentEvent] = []
+        kernel.register_subscriber(EventType.RESEARCH_INTENT_EMITTED, emitted.append)
+
+        request_id = executive.request_research(
+            query="promising niches", estimated_cost=5.0, search_depth=2, priority=7,
+            rationale="test rationale", deliberation_id="d1",
+        )
+        kernel.run_until_idle()
+
+        self.assertEqual(len(emitted), 1)
+        self.assertEqual(emitted[0].request_id, request_id)
+        self.assertEqual(emitted[0].query, "promising niches")
+        self.assertEqual(emitted[0].estimated_cost, 5.0)
+        self.assertEqual(emitted[0].search_depth, 2)
+        self.assertEqual(emitted[0].priority, 7)
+        self.assertNotIn(request_id, executive._pending_research_intents)
+
+
+class ExecutiveResearchSoftStopTests(unittest.TestCase):
+    def test_soft_stop_blocks_requests_after_a_low_novel_rate_window(self) -> None:
+        kernel, executive, governor = _make_executive_with_governor()
+        governor.fund_budget(BudgetState(budget_id="b1", available_attention=1000.0, available_capital=10000.0))
+        # Suppress cold start directly (rather than publishing a belief before
+        # start(), which would replay-double-dispatch once start() finally
+        # runs replay()) so this test's own window math isn't polluted by
+        # cold start's own 3 seed searches.
+        executive._belief_confidence["__test_seed__"] = 1.0
+        kernel.start()
+
+        requested: list[ResearchSpendRequestedEvent] = []
+        kernel.register_subscriber(EventType.RESEARCH_SPEND_REQUESTED, requested.append)
+
+        # A full window of searches, none of which trigger an accepted
+        # opportunity-generation pass (no belief events fired alongside
+        # these) -> the window closes at novel_rate == 0.0.
+        for i in range(SOFT_STOP_WINDOW_SEARCHES):
+            executive.request_research(
+                query=f"query-{i}", estimated_cost=1.0, search_depth=1, priority=1,
+                rationale="probe", deliberation_id="d1",
+            )
+        kernel.run_until_idle()
+        self.assertEqual(len(requested), SOFT_STOP_WINDOW_SEARCHES)
+        self.assertEqual(executive._last_window_novel_rate, 0.0)
+
+        blocked_request_id = executive.request_research(
+            query="one-more", estimated_cost=1.0, search_depth=1, priority=1,
+            rationale="probe", deliberation_id="d1",
+        )
+        kernel.run_until_idle()
+
+        self.assertIsNone(blocked_request_id)
+        self.assertEqual(len(requested), SOFT_STOP_WINDOW_SEARCHES)  # no new request published
+        soft_stopped = [
+            r for r in executive.decision_record_store.read_all() if r.decision_type == "research_soft_stopped"
+        ]
+        self.assertEqual(len(soft_stopped), 1)
+
+    def test_high_novel_rate_keeps_research_allowed(self) -> None:
+        kernel, executive, governor = _make_executive_with_governor()
+        executive._searches_issued_in_window = SOFT_STOP_WINDOW_SEARCHES
+        executive._novel_opportunities_in_window = SOFT_STOP_WINDOW_SEARCHES  # 100% novel rate
+        executive._note_search_issued()  # closes the window at rate 1.0
+
+        self.assertGreaterEqual(executive._last_window_novel_rate, SOFT_STOP_MIN_NOVEL_RATE)
+        self.assertTrue(executive._should_continue_researching())
+
+
+class ExecutiveResearchPriorityRankingTests(unittest.TestCase):
+    def test_batch_issues_requests_in_priority_descending_order(self) -> None:
+        kernel, executive, governor = _make_executive_with_governor()
+        governor.fund_budget(BudgetState(budget_id="b1", available_attention=100.0, available_capital=1000.0))
+        _publish_belief(kernel, "belief-a", 0.9)
+        kernel.start()
+
+        requested: list[ResearchSpendRequestedEvent] = []
+        kernel.register_subscriber(EventType.RESEARCH_SPEND_REQUESTED, requested.append)
+
+        candidates = [
+            ResearchCandidate(
+                query="low", estimated_cost=1.0, search_depth=1, priority=1, rationale="r", deliberation_id="d1"
+            ),
+            ResearchCandidate(
+                query="high", estimated_cost=1.0, search_depth=1, priority=9, rationale="r", deliberation_id="d1"
+            ),
+            ResearchCandidate(
+                query="mid", estimated_cost=1.0, search_depth=1, priority=5, rationale="r", deliberation_id="d1"
+            ),
+        ]
+        executive.request_research_batch(candidates)
+        kernel.run_until_idle()
+
+        self.assertEqual(len(requested), 3)
+        # Match published requests back to their originating query via the
+        # deterministic request_id (same derivation the Executive itself uses).
+        ranked_queries = []
+        for event in requested:
+            for candidate in candidates:
+                expected_id = executive._derive_research_request_id(
+                    deliberation_id=candidate.deliberation_id,
+                    query=candidate.query,
+                    search_depth=candidate.search_depth,
+                )
+                if expected_id == event.request_id:
+                    ranked_queries.append(candidate.query)
+                    break
+        self.assertEqual(ranked_queries, ["high", "mid", "low"])
 
 
 if __name__ == "__main__":

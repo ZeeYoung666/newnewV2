@@ -10,6 +10,7 @@ single winning plan while abandoning the rest.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -20,6 +21,7 @@ from src.events import (
     BeliefUpdatedEvent,
     EventType,
     ExecutiveDecisionEvent,
+    KernelStartedEvent,
     OpportunityGenerationCompletedEvent,
     OpportunityGenerationStartedEvent,
     OpportunityIdentifiedEvent,
@@ -27,6 +29,10 @@ from src.events import (
     OutcomeRecordedEvent,
     PlanAbandonedEvent,
     PlanProposedEvent,
+    ResearchIntentEvent,
+    ResearchSpendApprovedEvent,
+    ResearchSpendDeniedEvent,
+    ResearchSpendRequestedEvent,
 )
 from src.inference import InferencePort, InferenceRequest
 from src.kernel import Kernel
@@ -42,6 +48,36 @@ CAPITAL_COST_FRACTION = 0.1
 EV_ESTIMATION_PURPOSE = "estimate_expected_value"
 ATTENTION_DEMAND_FRACTION = 0.05
 CAPITAL_DEMAND_FRACTION = 0.1
+
+# Cold-start research seeding (Charter §2/§6): with zero prior beliefs, the
+# Executive still has to produce initial research intents derived from the
+# objective, not from a hardcoded industry or venture pick. Each seed query
+# asks a broad, industry-agnostic question aimed at DISCOVERING the space of
+# possible ventures ("what business models/niches exist right now") — it
+# never names a specific venture or industry to pursue. That is the whole
+# distinction Charter §4 ("not a recommendation engine") and §6 ("humans do
+# not choose industries, choose ventures") draw: discovering the search
+# space is not the same act as selecting within it. Selection still happens
+# later, in OpportunityGenerator/deliberate(), from whatever beliefs these
+# seed queries' results eventually produce.
+COLD_START_DELIBERATION_ID = "cold-start"
+COLD_START_ESTIMATED_COST_PER_QUERY = 5.0
+COLD_START_SEARCH_DEPTH = 1
+COLD_START_SEED_QUERIES: tuple[tuple[str, int], ...] = (
+    ("emerging profitable online business models 2026", 3),
+    ("underserved niche markets with low startup cost", 2),
+    ("recurring-revenue business models a solo operator can run", 1),
+)
+
+# Soft-stop heuristic (Executive's own call, distinct from Task #0's hard
+# budget/search/depth caps): a simple diminishing-returns check, deliberately
+# not over-engineered — every SOFT_STOP_WINDOW_SEARCHES searches issued, look
+# at how many of them led to an accepted (novel) opportunity-generation pass;
+# below SOFT_STOP_MIN_NOVEL_RATE, stop requesting more research until this
+# is revisited. No Charter/Architecture amendment needed to change these
+# numbers or the formula later.
+SOFT_STOP_WINDOW_SEARCHES = 5
+SOFT_STOP_MIN_NOVEL_RATE = 0.2
 
 
 @dataclass(slots=True, kw_only=True, frozen=True)
@@ -179,6 +215,50 @@ class ResolvedSituation:
 
     signature: str
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass(slots=True, kw_only=True, frozen=True)
+class PendingResearchIntent:
+    """A research spend request awaiting Governor's approve/deny decision.
+
+    Executive's own bookkeeping — recovers the query/priority/rationale a
+    bare ResearchSpendApprovedEvent/ResearchSpendDeniedEvent (Task #0) can't
+    carry, since that gate deliberately knows nothing about ResearchIntentEvent's
+    schema. Matched back to its decision by request_id.
+    """
+
+    request_id: str
+    query: str
+    estimated_cost: float
+    search_depth: int
+    priority: int
+    rationale: str
+    deliberation_id: str
+
+
+@dataclass(slots=True, kw_only=True, frozen=True)
+class ResearchCandidate:
+    """One candidate research query competing for scarce research budget."""
+
+    query: str
+    estimated_cost: float
+    search_depth: int
+    priority: int
+    rationale: str
+    deliberation_id: str
+
+
+@dataclass(slots=True, kw_only=True, frozen=True)
+class ResearchSoftStopState:
+    """Executive's own diminishing-returns bookkeeping for the research soft stop.
+
+    A single current-state snapshot (not an append-only ledger): only the
+    latest counters matter for the next decision.
+    """
+
+    searches_issued_in_window: int
+    novel_opportunities_in_window: int
+    last_window_novel_rate: Optional[float]
 
 
 class GoalStore:
@@ -372,6 +452,15 @@ class Executive:
         # Novelty index derived solely from Memory's OUTCOME_RECORDED events —
         # the sanctioned, event-based path into Memory's episodic history.
         self._resolved_signatures: set[str] = set()
+        # Research spend requests awaiting Governor's decision (Task #0's
+        # gate), keyed by request_id — never a new store, just an in-flight
+        # correlation map, mirroring Governor's own _pending_amendments shape.
+        self._pending_research_intents: dict[str, PendingResearchIntent] = {}
+        # Soft-stop bookkeeping (distinct from Task #0's hard caps): reset
+        # every SOFT_STOP_WINDOW_SEARCHES searches issued.
+        self._searches_issued_in_window = 0
+        self._novel_opportunities_in_window = 0
+        self._last_window_novel_rate: Optional[float] = None
         kernel.register_subscriber(EventType.BELIEF_CREATED, self._on_belief_created)
         kernel.register_subscriber(EventType.BELIEF_UPDATED, self._on_belief_updated)
         kernel.register_subscriber(EventType.OPPORTUNITY_GENERATION_STARTED, self._on_opportunity_generation_started)
@@ -384,6 +473,9 @@ class Executive:
         # full replay of the log reconstructs them exactly as a live run did.
         kernel.register_subscriber(EventType.PLAN_SELECTED, self._on_plan_selected)
         kernel.register_subscriber(EventType.PLAN_ABANDONED, self._on_plan_abandoned)
+        kernel.register_subscriber(EventType.RESEARCH_SPEND_APPROVED, self._on_research_spend_approved)
+        kernel.register_subscriber(EventType.RESEARCH_SPEND_DENIED, self._on_research_spend_denied)
+        kernel.register_subscriber(EventType.KERNEL_STARTED, self._on_kernel_started)
         kernel.register_snapshot_source(
             "executive.opportunities", Opportunity, self.opportunity_store.read_all, self._restore_opportunities
         )
@@ -411,6 +503,18 @@ class Executive:
             ResolvedSituation,
             self.resolved_situation_store.read_all,
             self._restore_resolved_situations,
+        )
+        kernel.register_snapshot_source(
+            "executive.pending_research_intents",
+            PendingResearchIntent,
+            self._capture_pending_research_intents,
+            self._restore_pending_research_intents,
+        )
+        kernel.register_snapshot_source(
+            "executive.research_soft_stop_state",
+            ResearchSoftStopState,
+            self._capture_research_soft_stop_state,
+            self._restore_research_soft_stop_state,
         )
 
     def _restore_opportunities(self, opportunities: list[Opportunity]) -> None:
@@ -456,6 +560,30 @@ class Executive:
         for entry in entries:
             self.resolved_situation_store.append(entry)
             self._resolved_signatures.add(entry.signature)
+
+    def _capture_pending_research_intents(self) -> list[PendingResearchIntent]:
+        return list(self._pending_research_intents.values())
+
+    def _restore_pending_research_intents(self, records: list[PendingResearchIntent]) -> None:
+        for record in records:
+            self._pending_research_intents[record.request_id] = record
+
+    def _capture_research_soft_stop_state(self) -> list[ResearchSoftStopState]:
+        return [
+            ResearchSoftStopState(
+                searches_issued_in_window=self._searches_issued_in_window,
+                novel_opportunities_in_window=self._novel_opportunities_in_window,
+                last_window_novel_rate=self._last_window_novel_rate,
+            )
+        ]
+
+    def _restore_research_soft_stop_state(self, records: list[ResearchSoftStopState]) -> None:
+        if not records:
+            return
+        latest = records[-1]
+        self._searches_issued_in_window = latest.searches_issued_in_window
+        self._novel_opportunities_in_window = latest.novel_opportunities_in_window
+        self._last_window_novel_rate = latest.last_window_novel_rate
 
     def _on_belief_created(self, event: BeliefCreatedEvent) -> None:
         self._belief_claim[event.belief_id] = event.claim
@@ -587,6 +715,13 @@ class Executive:
         if not event.accepted:
             return
 
+        # One data point for the research soft-stop heuristic: an accepted
+        # (novel) opportunity-generation pass, regardless of which sensor or
+        # belief triggered it. Until Task #2 wires research-attributed
+        # beliefs, this is the best available proxy for "did the last batch
+        # of searches turn up anything new."
+        self._novel_opportunities_in_window += 1
+
         assert event.group_id is not None and event.opportunity_id is not None
         self.opportunity_group_store.append(
             OpportunityGroup(
@@ -716,6 +851,201 @@ class Executive:
     def pending_plan_ids(self) -> list[str]:
         """Plans proposed but not yet committed or abandoned, oldest first."""
         return list(self._pending_plan_ids)
+
+    def _should_continue_researching(self) -> bool:
+        """Soft-stop check: has the last completed window shown diminishing returns?
+
+        Distinct from Task #0's hard budget/search/depth caps — this is the
+        Executive's own call about whether further research is still worth
+        asking for. No completed window yet means no evidence of
+        diminishing returns, so research is allowed to proceed.
+        """
+        if self._last_window_novel_rate is None:
+            return True
+        return self._last_window_novel_rate >= SOFT_STOP_MIN_NOVEL_RATE
+
+    def _note_search_issued(self) -> None:
+        self._searches_issued_in_window += 1
+        if self._searches_issued_in_window >= SOFT_STOP_WINDOW_SEARCHES:
+            self._last_window_novel_rate = round(
+                self._novel_opportunities_in_window / self._searches_issued_in_window, 6
+            )
+            self._searches_issued_in_window = 0
+            self._novel_opportunities_in_window = 0
+
+    @staticmethod
+    def _derive_research_request_id(*, deliberation_id: str, query: str, search_depth: int) -> str:
+        """A deterministic, content-addressed request_id.
+
+        `_on_kernel_started` (cold-start seeding) re-fires identically every
+        time KERNEL_STARTED is dispatched — live once, then again on every
+        future replay of that same historical event. A random uuid4() minted
+        there would differ between the live run and its replay, breaking the
+        later match against the Governor's ResearchSpendApprovedEvent /
+        ResearchSpendDeniedEvent (which only ever echoes back whatever
+        request_id it was actually sent — it doesn't re-mint). Deriving the
+        id from the request's own already-deterministic inputs instead means
+        replay reproduces the identical id, so this ledger's `pop(request_id)`
+        below always finds its match. Two genuinely distinct calls that
+        happen to share all three fields collide by design — out of scope
+        for this task's callers (cold start's queries are all distinct).
+        """
+        digest = hashlib.sha256(f"{deliberation_id}:{query}:{search_depth}".encode()).hexdigest()[:32]
+        return f"research-{digest}"
+
+    def request_research(
+        self,
+        *,
+        query: str,
+        estimated_cost: float,
+        search_depth: int,
+        priority: int,
+        rationale: str,
+        deliberation_id: str,
+    ) -> Optional[str]:
+        """Request approval to research one query, gated through Task #0's Governor.
+
+        Returns the request_id used to correlate the eventual approve/deny
+        decision, or None if the soft-stop heuristic decided not to even ask
+        (recorded as a decision either way). Never emits ResearchIntentEvent
+        directly — that only happens in `_on_research_spend_approved`, once
+        the Governor has actually granted the spend.
+        """
+        if not self._should_continue_researching():
+            self.decision_record_store.append(
+                DecisionRecord(
+                    decision_id=str(uuid4()),
+                    decision_type="research_soft_stopped",
+                    subject_id=deliberation_id,
+                    rationale=(
+                        f"query={query!r} not requested: last_window_novel_rate="
+                        f"{self._last_window_novel_rate} below minimum {SOFT_STOP_MIN_NOVEL_RATE}"
+                    ),
+                )
+            )
+            return None
+
+        request_id = self._derive_research_request_id(
+            deliberation_id=deliberation_id, query=query, search_depth=search_depth
+        )
+        self._pending_research_intents[request_id] = PendingResearchIntent(
+            request_id=request_id,
+            query=query,
+            estimated_cost=estimated_cost,
+            search_depth=search_depth,
+            priority=priority,
+            rationale=rationale,
+            deliberation_id=deliberation_id,
+        )
+        self._note_search_issued()
+        self._kernel.publish(
+            ResearchSpendRequestedEvent(
+                source_component="executive",
+                request_id=request_id,
+                deliberation_id=deliberation_id,
+                category="research",
+                estimated_cost=estimated_cost,
+                search_depth=search_depth,
+            )
+        )
+        return request_id
+
+    def request_research_batch(self, candidates: list[ResearchCandidate]) -> list[Optional[str]]:
+        """Rank competing research candidates and request each in ranked order.
+
+        Priority/ranking of competing research intents when budget is
+        scarce is the Executive's own call: reuses the same shape as
+        `deliberate()`'s ranking (highest value first, oldest-enumerated
+        first on ties) rather than a separate mechanism. Ranking here only
+        decides which candidates get first claim on whatever Task #0's hard
+        caps allow through — the caps themselves are still enforced solely
+        by the Governor.
+        """
+        ranked = sorted(enumerate(candidates), key=lambda pair: (-pair[1].priority, pair[0]))
+        request_ids: list[Optional[str]] = [None] * len(candidates)
+        for original_index, candidate in ranked:
+            request_ids[original_index] = self.request_research(
+                query=candidate.query,
+                estimated_cost=candidate.estimated_cost,
+                search_depth=candidate.search_depth,
+                priority=candidate.priority,
+                rationale=candidate.rationale,
+                deliberation_id=candidate.deliberation_id,
+            )
+        return request_ids
+
+    def _on_research_spend_approved(self, event: ResearchSpendApprovedEvent) -> None:
+        pending = self._pending_research_intents.pop(event.request_id, None)
+        if pending is None:
+            return
+        self._kernel.publish(
+            ResearchIntentEvent(
+                source_component="executive",
+                request_id=event.request_id,
+                query=pending.query,
+                estimated_cost=event.approved_cost,
+                search_depth=pending.search_depth,
+                priority=pending.priority,
+                rationale=pending.rationale,
+            )
+        )
+        self.decision_record_store.append(
+            DecisionRecord(
+                decision_id=str(uuid4()),
+                decision_type="research_intent_emitted",
+                subject_id=event.request_id,
+                rationale=f"query={pending.query!r} approved_cost={event.approved_cost} reason={event.reason}",
+            )
+        )
+
+    def _on_research_spend_denied(self, event: ResearchSpendDeniedEvent) -> None:
+        pending = self._pending_research_intents.pop(event.request_id, None)
+        if pending is None:
+            return
+        self.decision_record_store.append(
+            DecisionRecord(
+                decision_id=str(uuid4()),
+                decision_type="research_intent_denied",
+                subject_id=event.request_id,
+                rationale=f"query={pending.query!r} denied: {event.reason}",
+            )
+        )
+
+    def _on_kernel_started(self, event: KernelStartedEvent) -> None:
+        """Cold-start research seeding (Charter §2/§6): with zero prior beliefs,
+        derive initial research intents from the objective instead of sitting idle.
+
+        Guarded by both conditions so a restart with existing history never
+        re-seeds: `replay()` (which runs before KERNEL_STARTED, per
+        Kernel.start()) would already have repopulated `_belief_confidence`
+        and this decision-record marker from that history.
+        """
+        already_seeded = any(
+            record.decision_type == "cold_start_research_seeded" for record in self.decision_record_store.read_all()
+        )
+        if already_seeded or self._belief_confidence:
+            return
+
+        candidates = [
+            ResearchCandidate(
+                query=query,
+                estimated_cost=COLD_START_ESTIMATED_COST_PER_QUERY,
+                search_depth=COLD_START_SEARCH_DEPTH,
+                priority=priority,
+                rationale="cold-start: discover venture space from objective, no prior beliefs",
+                deliberation_id=COLD_START_DELIBERATION_ID,
+            )
+            for query, priority in COLD_START_SEED_QUERIES
+        ]
+        self.request_research_batch(candidates)
+        self.decision_record_store.append(
+            DecisionRecord(
+                decision_id=str(uuid4()),
+                decision_type="cold_start_research_seeded",
+                subject_id=COLD_START_DELIBERATION_ID,
+                rationale=f"issued {len(candidates)} seed queries derived from the objective",
+            )
+        )
 
     def deliberate(self, *, available_attention: float, available_capital: float) -> Optional[DeliberationResult]:
         """Run one deliberation pass over every pending candidate plan.
@@ -923,5 +1253,14 @@ __all__ = [
     "DecisionRecordStore",
     "Allocation",
     "DeliberationResult",
+    "PendingResearchIntent",
+    "ResearchCandidate",
+    "ResearchSoftStopState",
+    "COLD_START_DELIBERATION_ID",
+    "COLD_START_ESTIMATED_COST_PER_QUERY",
+    "COLD_START_SEARCH_DEPTH",
+    "COLD_START_SEED_QUERIES",
+    "SOFT_STOP_WINDOW_SEARCHES",
+    "SOFT_STOP_MIN_NOVEL_RATE",
     "Executive",
 ]

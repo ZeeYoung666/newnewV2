@@ -57,6 +57,46 @@ breaches, budget window, snapshot round-trip, estimate-only marker); full
 suite green: 455 passed, 4 subtests passed. Commit: `c093b91` (core),
 `bc9cf16` (Charter.md tracked), `e67a682` (estimate_only marker).
 
+## Task #1 — done
+
+Executive now owns `ResearchIntentEvent` (query, estimated_cost,
+search_depth, priority, rationale, request_id) — the concrete schema
+Task #0's gate deliberately stayed blind to. Before emitting one, Executive
+publishes `ResearchSpendRequestedEvent` and waits for the Governor's async
+`ResearchSpendApprovedEvent`/`ResearchSpendDeniedEvent` (matched by
+request_id via a `PendingResearchIntent` correlation map, never a new
+store); on denial it records a `research_intent_denied` DecisionRecord and
+never emits the intent. Cold start: with zero prior beliefs, Executive
+seeds 3 fixed, industry-agnostic queries derived from Charter §2 (e.g.
+"emerging profitable online business models 2026") on `KERNEL_STARTED` —
+these discover the venture *space*, they don't select *within* it (Charter
+§4/§6), so they don't count as a human-selected venture or industry.
+Soft stop (Executive's own call, distinct from Task #0's hard caps): a
+sliding window of `SOFT_STOP_WINDOW_SEARCHES` (5) searches closes with a
+novel-opportunity rate; below `SOFT_STOP_MIN_NOVEL_RATE` (0.2), further
+requests are refused with a `research_soft_stopped` decision record until
+revisited — no Charter/Architecture amendment needed to retune this.
+Competing research candidates are ranked priority-descending (FIFO
+tie-break), mirroring `deliberate()`'s ranking shape rather than a second
+ranking mechanism; Task #0's hard caps still decide what actually clears.
+
+One correctness fix load-bearing for replay: `request_id` is derived
+deterministically (`sha256(deliberation_id:query:search_depth)`) rather
+than `uuid4()`, because `_on_kernel_started` (and any future event-driven
+caller of `request_research`) re-fires identically on every replay of its
+triggering event — a random id would differ from the one already baked
+into the historical `ResearchSpendApprovedEvent`/`DeniedEvent`, breaking
+the correlation lookup on replay. New tests added (cold start, gate
+approve/deny, soft stop, priority ranking, replay determinism); full suite
+green: 466 passed, 4 subtests passed. Commit: pending.
+
+**Ambiguity resolved, not guessed**: cold-start seed queries, their fixed
+priorities, and the soft-stop window/threshold numbers are stated
+constants in `src/executive/__init__.py`, chosen as reasonable defaults
+per the task's "do not over-engineer" instruction — revisable later
+without Charter/Architecture ceremony, same as Task #0's research budget
+numbers.
+
 ## Deferred
 
 - Phase 2 knowledge graph — until revenue demonstrated.
