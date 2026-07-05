@@ -1472,6 +1472,13 @@ class ResearchSpendRecordModelTests(unittest.TestCase):
         self.assertEqual(record.category, "research")
         self.assertEqual(record.cost, 5.0)
 
+    def test_record_defaults_to_estimate_only(self) -> None:
+        record = ResearchSpendRecord(
+            request_id="request-1", correlation_id="correlation-1", category="research", cost=5.0
+        )
+
+        self.assertTrue(record.estimate_only)
+
     def test_record_is_immutable(self) -> None:
         record = ResearchSpendRecord(
             request_id="request-1", correlation_id="correlation-1", category="research", cost=5.0
@@ -1490,6 +1497,21 @@ class ResearchSpendLedgerTests(unittest.TestCase):
 
         self.assertEqual(ledger.total_for_correlation("c1"), 8.0)
 
+    def test_estimate_only_records_returns_unreconciled_entries(self) -> None:
+        ledger = ResearchSpendLedger()
+        ledger.append(
+            ResearchSpendRecord(
+                request_id="r1", correlation_id="c1", category="research", cost=5.0, estimate_only=True
+            )
+        )
+        ledger.append(
+            ResearchSpendRecord(
+                request_id="r2", correlation_id="c2", category="research", cost=3.0, estimate_only=False
+            )
+        )
+
+        self.assertEqual([r.request_id for r in ledger.estimate_only_records()], ["r1"])
+
 
 class MemoryLedgerResearchSpendTests(unittest.TestCase):
     def test_research_spend_approved_is_recorded_under_its_correlation_id(self) -> None:
@@ -1503,6 +1525,7 @@ class MemoryLedgerResearchSpendTests(unittest.TestCase):
         self.assertEqual(records[0].request_id, "request-1")
         self.assertEqual(records[0].cost, 7.5)
         self.assertNotEqual(records[0].correlation_id, "")
+        self.assertTrue(records[0].estimate_only)
 
     def test_multiple_approvals_under_the_same_correlation_id_accumulate(self) -> None:
         kernel = Kernel()

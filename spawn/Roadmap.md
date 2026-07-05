@@ -47,9 +47,15 @@ fulfillment (Task #1) without the Governor knowing that event's schema.
 Governor tracks its own rolling-window `ResearchSpendLedger` (never reads
 Memory & Ledger's store); Memory & Ledger separately records approved
 research spend per `correlation_id` from `ResearchSpendApprovedEvent`, so a
-later EV computation can net out acquisition cost. New tests added (rule
-breaches, budget window, snapshot round-trip); full suite green: 453
-passed, 4 subtests passed. Commit: `c093b91`.
+later EV computation can net out acquisition cost. Every recorded entry
+carries `estimate_only: bool = True` — as of Task #0 no
+ResearchObservationEvent exists to report actual spend, so cost is always
+the Governor-approved estimate. `ResearchSpendLedger.estimate_only_records()`
+gives Task #2 a direct query target: reconciling actuals means flipping
+these records, not silently trusting them as final. New tests added (rule
+breaches, budget window, snapshot round-trip, estimate-only marker); full
+suite green: 455 passed, 4 subtests passed. Commit: `c093b91` (core),
+`bc9cf16` (Charter.md tracked), plus the commit landing this note.
 
 ## Deferred
 

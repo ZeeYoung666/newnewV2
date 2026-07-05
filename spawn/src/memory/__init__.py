@@ -140,12 +140,19 @@ class ResearchSpendRecord:
     architecture's no-cross-store-access rule. Keyed by correlation_id so
     a later EV computation can net out research acquisition cost for the
     whole causal chain a research spend belongs to.
+
+    `estimate_only` is always True as of Task #0: no ResearchObservationEvent
+    exists yet to report actual spend (that lands in Task #2), so `cost`
+    here is always the Governor-approved *estimate*, never a reconciled
+    actual. This is a deliberate, queryable marker — Task #2 must find and
+    flip these records to actuals, not silently trust them as final.
     """
 
     request_id: str
     correlation_id: str
     category: str
     cost: float
+    estimate_only: bool = True
     recorded_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -166,6 +173,16 @@ class ResearchSpendLedger:
 
     def total_for_correlation(self, correlation_id: str) -> float:
         return sum(record.cost for record in self.for_correlation(correlation_id))
+
+    def estimate_only_records(self) -> list[ResearchSpendRecord]:
+        """Every record still carrying an estimate, not yet reconciled to actual spend.
+
+        Task #2's reconciliation queries this directly: as of Task #0, every
+        record is estimate_only (no ResearchObservationEvent exists yet to
+        report actuals), so an empty result here is the signal that
+        reconciliation has landed and is doing its job.
+        """
+        return [record for record in self._records if record.estimate_only]
 
 
 class HeuristicStore:
@@ -695,6 +712,7 @@ class MemoryLedger:
                 correlation_id=str(event.correlation_id) if event.correlation_id is not None else "",
                 category=event.category,
                 cost=event.approved_cost,
+                estimate_only=True,
             )
         )
 
