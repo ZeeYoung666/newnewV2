@@ -12,6 +12,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass, fields as dataclass_fields
+from pathlib import Path
 from typing import IO, Optional
 
 from src.events import Event, EventType
@@ -25,7 +26,7 @@ from src.executive import (
 from src.executor import Executor
 from src.governor import BudgetState, Constitution, Governor
 from src.inference import InferencePort, MockInferenceProvider, ProviderRegistry
-from src.kernel import Kernel
+from src.kernel import EventLog, Kernel
 from src.memory import MemoryLedger
 from src.perception import Observation, Perception
 from src.world_model import WorldModel
@@ -44,6 +45,11 @@ BOOTSTRAP_MAX_SEARCHES_PER_DELIBERATION = 5
 BOOTSTRAP_MAX_SEARCH_DEPTH = 3
 EXPLORATION_DELIBERATION_ID = "manual-exploration"
 DEFAULT_EXPLORATION_TIMEOUT_SECONDS = 30.0
+# CLI persistence: no config-file/env-var pattern exists elsewhere in this
+# project (checked before inventing one), so this is a plain argparse flag
+# with a relative-to-cwd default, same style as --timeout below.
+DEFAULT_DATA_DIR = "aether_data"
+EVENT_LOG_FILENAME = "event_log.jsonl"
 
 # Minimal exploration visibility (CLI): a read-only printer, registered
 # against every EventType, that streams each event to stdout as the Kernel
@@ -250,9 +256,18 @@ def run_bootstrap_cycle(organism: Organism) -> Observation:
     return observation
 
 
-def main() -> Organism:
-    """Boot the organism: build it, configure it, start the Kernel, and prove it is alive."""
-    organism = build_organism()
+def main(kernel: Optional[Kernel] = None) -> Organism:
+    """Boot the organism: build it, configure it, start the Kernel, and prove it is alive.
+
+    With no ``kernel``, ``build_organism`` gets its usual fresh in-memory
+    default (unchanged library/test behavior — every existing caller that
+    does ``main.main()`` still gets an isolated, historyless organism). The
+    CLI (``_cli``) is the one caller that passes a disk-backed ``Kernel`` so
+    the process actually persists across separate invocations; that
+    persistence is deliberately not this function's default so unit tests
+    stay isolated regardless of what a previous CLI run left on disk.
+    """
+    organism = build_organism(kernel=kernel)
     configure_bootstrap(organism)
     organism.kernel.start()
     run_bootstrap_cycle(organism)
@@ -315,6 +330,15 @@ def _cli() -> None:
 
     No packaging/console-script exists for this project, so there is no
     installed ``aether`` binary — invoke as ``python main.py explore``.
+
+    Both subcommands build against one disk-backed ``Kernel`` under
+    ``--data-dir`` (default ``DEFAULT_DATA_DIR``), so state — including the
+    Executive's cold-start decision record and every belief it seeds —
+    survives across separate CLI invocations. ``Kernel.start()`` replays
+    that file before dispatching ``KERNEL_STARTED``, which is exactly what
+    makes ``Executive._on_kernel_started``'s "already seeded?" guard see
+    real history on the second and every later run, instead of the
+    always-empty log a fresh in-memory ``Kernel()`` would hand it.
     """
     import argparse
 
@@ -326,17 +350,25 @@ def _cli() -> None:
         default=DEFAULT_EXPLORATION_TIMEOUT_SECONDS,
         help="explore only: wall-clock seconds the cycle is expected to finish within (default: %(default)s)",
     )
+    parser.add_argument(
+        "--data-dir",
+        default=DEFAULT_DATA_DIR,
+        help="directory holding the persisted event log, shared across CLI invocations (default: %(default)s)",
+    )
     args = parser.parse_args()
 
+    log_path = Path(args.data_dir) / EVENT_LOG_FILENAME
+    kernel = Kernel(event_log=EventLog(path=log_path))
+
     if args.command == "explore":
-        organism = build_organism()
+        organism = build_organism(kernel=kernel)
         configure_bootstrap(organism)
         attach_event_stream(organism.kernel)
         organism.kernel.start()
         run_exploration_cycle(organism, timeout=args.timeout)
         organism.kernel.stop()
     else:
-        main()
+        main(kernel=kernel)
 
 
 if __name__ == "__main__":
