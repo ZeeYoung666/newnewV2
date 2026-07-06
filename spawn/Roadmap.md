@@ -103,3 +103,7 @@ numbers.
 
 - Phase 2 knowledge graph — until revenue demonstrated.
 - Generic actuators (deploy, publish, list, move money) — after milestone 3, before milestone 4.
+
+## Developer backlog
+
+- Minimal exploration visibility (CLI): `attach_event_stream` in `main.py` prints every event live during `python main.py explore` (color-coded by owning component, `--timeout` flag reports overruns). Read-only bus observer, no new event types, no Executive/Governor/Perception logic changes. Commit: `c6b05c1`.
