@@ -8,9 +8,13 @@ Execution -> Outcome -> Memory flow using only typed events.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+import os
+import sys
+import time
+from dataclasses import dataclass, fields as dataclass_fields
+from typing import IO, Optional
 
+from src.events import Event, EventType
 from src.executive import (
     COLD_START_ESTIMATED_COST_PER_QUERY,
     COLD_START_SEARCH_DEPTH,
@@ -39,6 +43,100 @@ BOOTSTRAP_RESEARCH_BUDGET_WINDOW_SECONDS = 86400.0
 BOOTSTRAP_MAX_SEARCHES_PER_DELIBERATION = 5
 BOOTSTRAP_MAX_SEARCH_DEPTH = 3
 EXPLORATION_DELIBERATION_ID = "manual-exploration"
+DEFAULT_EXPLORATION_TIMEOUT_SECONDS = 30.0
+
+# Minimal exploration visibility (CLI): a read-only printer, registered
+# against every EventType, that streams each event to stdout as the Kernel
+# dispatches it. Colors group events by owning component; ANSI codes are
+# skipped entirely when the stream isn't a real terminal or NO_COLOR is set
+# (https://no-color.org), so redirected/piped output stays plain text.
+_EVENT_STREAM_RESET = "\033[0m"
+_EVENT_STREAM_BLUE = "\033[34m"  # research / perception
+_EVENT_STREAM_PURPLE = "\033[35m"  # beliefs / opportunities / plans
+_EVENT_STREAM_GOLD = "\033[33m"  # governor
+_EVENT_STREAM_GREEN = "\033[32m"  # execution
+_EVENT_STREAM_CYAN = "\033[36m"  # memory / learning
+_EVENT_STREAM_COLOR_BY_PREFIX: dict[str, str] = {
+    "research": _EVENT_STREAM_BLUE,
+    "observation": _EVENT_STREAM_BLUE,
+    "sensor": _EVENT_STREAM_BLUE,
+    "inference": _EVENT_STREAM_BLUE,
+    "belief": _EVENT_STREAM_PURPLE,
+    "opportunity": _EVENT_STREAM_PURPLE,
+    "plan": _EVENT_STREAM_PURPLE,
+    "executive": _EVENT_STREAM_PURPLE,
+    "policy": _EVENT_STREAM_GOLD,
+    "budget": _EVENT_STREAM_GOLD,
+    "approval": _EVENT_STREAM_GOLD,
+    "constitution": _EVENT_STREAM_GOLD,
+    "escalation": _EVENT_STREAM_GOLD,
+    "action": _EVENT_STREAM_GREEN,
+    "sandbox": _EVENT_STREAM_GREEN,
+    "credential": _EVENT_STREAM_GREEN,
+    "outcome": _EVENT_STREAM_CYAN,
+    "prediction": _EVENT_STREAM_CYAN,
+    "learning": _EVENT_STREAM_CYAN,
+    "knowledge": _EVENT_STREAM_CYAN,
+    "ledger": _EVENT_STREAM_CYAN,
+}
+# event_type values not covered above (currently just "kernel.*" lifecycle
+# events) print uncolored rather than raising a KeyError.
+_EVENT_STREAM_BASE_FIELDS = {
+    "source_component",
+    "id",
+    "timestamp",
+    "correlation_id",
+    "event_type",
+    "event_version",
+}
+
+
+def _format_event_line(event: Event) -> str:
+    """One line: timestamp, event type, correlation_id, then every field the
+    concrete event subclass adds beyond the common Event base — whatever
+    that event actually carries today, nothing assumed or stubbed for a
+    stage that isn't wired yet.
+    """
+    extra = ", ".join(
+        f"{f.name}={getattr(event, f.name)!r}"
+        for f in dataclass_fields(event)
+        if f.name not in _EVENT_STREAM_BASE_FIELDS
+    )
+    timestamp = event.timestamp.isoformat(timespec="milliseconds")
+    return f"{timestamp} {event.event_type.value:<32} correlation_id={event.correlation_id} {extra}"
+
+
+def _colorize_event_line(event_type: EventType, line: str) -> str:
+    prefix = event_type.value.split(".", 1)[0]
+    color = _EVENT_STREAM_COLOR_BY_PREFIX.get(prefix, "")
+    return f"{color}{line}{_EVENT_STREAM_RESET}" if color else line
+
+
+def attach_event_stream(kernel: Kernel, *, stream: Optional[IO[str]] = None, color: Optional[bool] = None) -> None:
+    """Read-only observer: print every event live as the Kernel dispatches it.
+
+    Kernel.register_subscriber has no wildcard, so the only way to observe
+    the full bus is to register the same printer against every EventType
+    member individually — still just "adding a subscriber", the same
+    mechanism every component already uses, nothing added to the Kernel
+    itself. This function never publishes an event, never reads or mutates
+    any component's state, and cannot affect replay (Kernel.publish
+    dispatches to subscribers exactly the same during a live run or a
+    replay; this only ever prints).
+    """
+    out = stream if stream is not None else sys.stdout
+    use_color = color if color is not None else (hasattr(out, "isatty") and out.isatty() and "NO_COLOR" not in os.environ)
+
+    def _print_event(event: Event) -> None:
+        try:
+            line = _format_event_line(event)
+            line = _colorize_event_line(event.event_type, line) if use_color else line
+        except Exception as exc:  # a formatting bug must never break the pipeline it's observing
+            line = f"<unprintable event {event.event_type!r}: {exc!r}>"
+        print(line, file=out, flush=True)
+
+    for event_type in EventType:
+        kernel.register_subscriber(event_type, _print_event)
 
 
 @dataclass(slots=True)
@@ -162,7 +260,9 @@ def main() -> Organism:
     return organism
 
 
-def run_exploration_cycle(organism: Organism) -> list[Optional[str]]:
+def run_exploration_cycle(
+    organism: Organism, *, timeout: float = DEFAULT_EXPLORATION_TIMEOUT_SECONDS
+) -> list[Optional[str]]:
     """Fire one Economic Exploration cycle from the current objective, then drain it to completion.
 
     Touches exactly one public entry point on the running organism —
@@ -181,7 +281,16 @@ def run_exploration_cycle(organism: Organism) -> list[Optional[str]]:
     event queue is fully drained, carrying whatever request_ids the batch
     produced (a request_id is ``None`` where the soft-stop heuristic declined
     to even ask — see ``Executive.request_research``).
+
+    ``timeout`` is a wall-clock budget this reports against, not one it
+    preempts: every stage in this pipeline is synchronous and network-free,
+    so there is nothing to interrupt mid-flight without racing the Kernel's
+    own event-log writes — which would risk exactly the replay-determinism
+    guarantee this CLI path must not touch. If the cycle still exceeds the
+    budget, a warning is printed to stderr after the fact; the cycle itself
+    always runs to completion.
     """
+    started_at = time.monotonic()
     candidates = [
         ResearchCandidate(
             query=query,
@@ -195,6 +304,9 @@ def run_exploration_cycle(organism: Organism) -> list[Optional[str]]:
     ]
     request_ids = organism.executive.request_research_batch(candidates)
     organism.kernel.run_until_idle()
+    elapsed = time.monotonic() - started_at
+    if elapsed > timeout:
+        print(f"[explore] cycle took {elapsed:.2f}s, exceeding the {timeout:.2f}s timeout", file=sys.stderr)
     return request_ids
 
 
@@ -208,13 +320,20 @@ def _cli() -> None:
 
     parser = argparse.ArgumentParser(prog="main.py")
     parser.add_argument("command", nargs="?", default="bootstrap", choices=("bootstrap", "explore"))
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_EXPLORATION_TIMEOUT_SECONDS,
+        help="explore only: wall-clock seconds the cycle is expected to finish within (default: %(default)s)",
+    )
     args = parser.parse_args()
 
     if args.command == "explore":
         organism = build_organism()
         configure_bootstrap(organism)
+        attach_event_stream(organism.kernel)
         organism.kernel.start()
-        run_exploration_cycle(organism)
+        run_exploration_cycle(organism, timeout=args.timeout)
         organism.kernel.stop()
     else:
         main()
