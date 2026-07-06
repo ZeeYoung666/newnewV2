@@ -9,11 +9,13 @@ Answers "in what order," not "what" (Charter.md) or "how it's structured" (Archi
 
 1. Autonomous experiment — DONE
 2. Real-world evidence gathered — DONE
-3. Economic Exploration — ACTIVE
+3. First Breath — ACTIVE
+   Pass: a single command starts one exploration cycle; the complete cognitive pipeline (research → observation → belief → opportunity → plan → Governor approval → execution → outcome) executes end to end; the operator observes every significant state transition live through the Observatory. Task D (`Executive.deliberate()` integration) remains deferred, non-blocking.
+4. Economic Exploration — ACTIVE
    Pass: Aether autonomously produces a ranked list of venture hypotheses (EV, startup cost, barriers, confidence, rationale) from its own research, no human-selected venture or industry, every entry traceable to research events.
-4. First revenue through the full decision chain
-5. Full decision chain explanation
-6. Autonomous reinvestment
+5. First revenue through the full decision chain
+6. Full decision chain explanation
+7. Autonomous reinvestment
 
 ## Standing rule (post-1.0)
 

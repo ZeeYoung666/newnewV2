@@ -60,7 +60,10 @@ class SnapshotCreationTests(unittest.TestCase):
             self.assertIsNotNone(record)
             self.assertEqual(record["sequence"], sequence)
             self.assertIn("world_model.beliefs", record["sources"])
-            self.assertEqual(len(record["sources"]["world_model.beliefs"]), 1)
+            # 3 from the Executive's cold-start research seeding (Task #1),
+            # now real beliefs via Perception (Task #2.6), plus 1 from
+            # _boot_fresh's explicit bootstrap observation.
+            self.assertEqual(len(record["sources"]["world_model.beliefs"]), 4)
 
 
 class SnapshotAssistedRestartTests(unittest.TestCase):

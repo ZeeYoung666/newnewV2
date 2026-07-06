@@ -1,7 +1,7 @@
 import dataclasses
 import unittest
 
-from src.events import Event, EventType, ObservationCreatedEvent
+from src.events import Event, EventType, ObservationCreatedEvent, ResearchIntentEvent
 from src.kernel import Kernel
 from src.perception import (
     AdapterRegistry,
@@ -186,6 +186,25 @@ class PerceptionTests(unittest.TestCase):
             )
 
         self.assertEqual(perception.observation_log.read_all(), [])
+
+
+class PerceptionResearchIntentTests(unittest.TestCase):
+    def test_perception_subscribes_to_research_intent_emitted(self) -> None:
+        kernel = Kernel()
+        perception = Perception(kernel)
+
+        event = ResearchIntentEvent(
+            source_component="executive",
+            request_id="research-abc123",
+            query="who are the leading vendors in X",
+            estimated_cost=5.0,
+            search_depth=2,
+            priority=1,
+            rationale="cold-start: discover venture space from objective, no prior beliefs",
+        )
+        kernel.publish(event)
+
+        self.assertEqual(perception.received_research_intents, [event])
 
 
 class AdapterRegistryTests(unittest.TestCase):

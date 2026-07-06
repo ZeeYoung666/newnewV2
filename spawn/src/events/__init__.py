@@ -65,6 +65,7 @@ class EventType(str, Enum):
     KERNEL_STARTED = "kernel.started"
     KERNEL_STOPPING = "kernel.stopping"
     KERNEL_STOPPED = "kernel.stopped"
+    EXECUTIVE_DELIBERATION_STEP = "executive.deliberation_step"
 
 
 @dataclass(slots=True, kw_only=True)
@@ -583,9 +584,10 @@ class ResearchIntentEvent(Event):
     Task #0's spend gate deliberately stayed blind to, so it is only ever
     emitted after the matching ResearchSpendRequestedEvent has already been
     approved (request_id links the two). Perception (Task #2) is the sole
-    future consumer; it turns this into an actual search and a
-    ResearchObservationEvent. Perception never invents its own research
-    directions — the Executive is the only place this event originates.
+    consumer; it turns this into an Observation/ObservationCreatedEvent
+    through its existing pipeline rather than a dedicated research event
+    type. Perception never invents its own research directions — the
+    Executive is the only place this event originates.
     """
 
     request_id: str
@@ -670,6 +672,28 @@ class KernelStoppedEvent(Event):
     event_type: EventType = EventType.KERNEL_STOPPED
 
 
+@dataclass(slots=True, kw_only=True)
+class ExecutiveDeliberationStep(Event):
+    """Traces one internal reasoning step of an Executive deliberation pass.
+
+    Publish-only observability: no subscriber ever reacts to this event, it
+    mutates no Executive state, and it plays no role in snapshot/replay —
+    it exists solely so an operator can see the EV-estimation and
+    attention/capital allocation reasoning that `deliberate()` otherwise
+    only leaks as fragments of rationale strings on the winning/abandoned
+    plan events. Grouping across the steps of one deliberation pass relies
+    on `correlation_id`, not a dedicated pass id — see Kernel.publish's
+    active-correlation propagation, which already gives every event
+    published during one un-nested `deliberate()` call the same id.
+    """
+
+    step: str
+    inputs: dict
+    outputs: dict
+    reason: str
+    event_type: EventType = EventType.EXECUTIVE_DELIBERATION_STEP
+
+
 __all__ = [
     "Event",
     "EventType",
@@ -726,4 +750,5 @@ __all__ = [
     "KernelStartedEvent",
     "KernelStoppingEvent",
     "KernelStoppedEvent",
+    "ExecutiveDeliberationStep",
 ]

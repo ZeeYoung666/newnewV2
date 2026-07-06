@@ -45,8 +45,11 @@ class ReplayOnStartTests(unittest.TestCase):
         organism.kernel.start()
 
         self.assertTrue(organism.kernel.is_running())
-        self.assertEqual(organism.world_model.belief_store.read_all(), [])
-        self.assertEqual(organism.executor.action_log.read_all(), [])
+        # Not actually empty: Kernel.start() fires the Executive's cold-start
+        # research seeding (Task #1), which Perception (Task #2.6) now turns
+        # into real beliefs/actions even with no explicit observation yet.
+        self.assertEqual(len(organism.world_model.belief_store.read_all()), 3)
+        self.assertEqual(len(organism.executor.action_log.read_all()), 2)
 
     def test_existing_log_reconstructs_all_component_state(self) -> None:
         original = _boot_fresh(self.log_path)

@@ -11,7 +11,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from src.executive import Executive
+from src.executive import (
+    COLD_START_ESTIMATED_COST_PER_QUERY,
+    COLD_START_SEARCH_DEPTH,
+    COLD_START_SEED_QUERIES,
+    Executive,
+    ResearchCandidate,
+)
 from src.executor import Executor
 from src.governor import BudgetState, Constitution, Governor
 from src.inference import InferencePort, MockInferenceProvider, ProviderRegistry
@@ -32,6 +38,7 @@ BOOTSTRAP_RESEARCH_BUDGET = 50.0
 BOOTSTRAP_RESEARCH_BUDGET_WINDOW_SECONDS = 86400.0
 BOOTSTRAP_MAX_SEARCHES_PER_DELIBERATION = 5
 BOOTSTRAP_MAX_SEARCH_DEPTH = 3
+EXPLORATION_DELIBERATION_ID = "manual-exploration"
 
 
 @dataclass(slots=True)
@@ -155,5 +162,63 @@ def main() -> Organism:
     return organism
 
 
+def run_exploration_cycle(organism: Organism) -> list[Optional[str]]:
+    """Fire one Economic Exploration cycle from the current objective, then drain it to completion.
+
+    Touches exactly one public entry point on the running organism —
+    ``Executive.request_research_batch`` — the same objective-driven research
+    API the cold-start seeding path already uses internally (Charter §2/§6:
+    broad, industry-agnostic discovery queries derived from the objective,
+    never a specific venture pick). Everything downstream of that call
+    (Governor's approve/deny decision, Executive's own ResearchIntentEvent
+    emission, and whatever else is currently wired to react from there)
+    happens exclusively through the Kernel's typed events — this function
+    never touches Perception, World Model, Governor, Executor, or Memory
+    directly, and it never calls Executive.deliberate() (that stage is an
+    internal organism concern, not something a manual trigger reaches into).
+
+    Fires once and returns; no scheduler, no loop. Returns once the Kernel's
+    event queue is fully drained, carrying whatever request_ids the batch
+    produced (a request_id is ``None`` where the soft-stop heuristic declined
+    to even ask — see ``Executive.request_research``).
+    """
+    candidates = [
+        ResearchCandidate(
+            query=query,
+            estimated_cost=COLD_START_ESTIMATED_COST_PER_QUERY,
+            search_depth=COLD_START_SEARCH_DEPTH,
+            priority=priority,
+            rationale="manual exploration cycle: derived from the current objective",
+            deliberation_id=EXPLORATION_DELIBERATION_ID,
+        )
+        for query, priority in COLD_START_SEED_QUERIES
+    ]
+    request_ids = organism.executive.request_research_batch(candidates)
+    organism.kernel.run_until_idle()
+    return request_ids
+
+
+def _cli() -> None:
+    """CLI dispatch: ``python main.py [bootstrap|explore]`` (defaults to bootstrap).
+
+    No packaging/console-script exists for this project, so there is no
+    installed ``aether`` binary — invoke as ``python main.py explore``.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="main.py")
+    parser.add_argument("command", nargs="?", default="bootstrap", choices=("bootstrap", "explore"))
+    args = parser.parse_args()
+
+    if args.command == "explore":
+        organism = build_organism()
+        configure_bootstrap(organism)
+        organism.kernel.start()
+        run_exploration_cycle(organism)
+        organism.kernel.stop()
+    else:
+        main()
+
+
 if __name__ == "__main__":
-    main()
+    _cli()

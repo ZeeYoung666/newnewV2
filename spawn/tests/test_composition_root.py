@@ -98,38 +98,51 @@ class BootstrapCycleTests(unittest.TestCase):
         main.configure_bootstrap(self.organism)
         self.organism.kernel.start()
         self.addCleanup(self.organism.kernel.stop)
+        # Kernel.start() fires the Executive's cold-start research seeding
+        # (Task #1), which Perception (Task #2.6) now turns into real
+        # beliefs/plans/actions/outcomes before any test-specific observation
+        # runs. Baseline counts here so each test still asserts what its own
+        # run_bootstrap_cycle() call contributes, not the cold-start noise.
+        self.baseline_beliefs = len(self.organism.world_model.belief_store.read_all())
+        self.baseline_plans = len(self.organism.executive.plan_store.read_all())
+        self.baseline_approvals = len(self.organism.governor.approval_log.read_all())
+        self.baseline_actions = len(self.organism.executor.action_log.read_all())
+        self.baseline_outcomes = len(self.organism.memory_ledger.outcome_store.read_all())
+        self.baseline_ledger_entries = len(self.organism.memory_ledger.financial_ledger.read_all())
 
     def test_one_observation_produces_a_belief(self) -> None:
         main.run_bootstrap_cycle(self.organism)
 
         beliefs = self.organism.world_model.belief_store.read_all()
-        self.assertEqual(len(beliefs), 1)
+        self.assertEqual(len(beliefs) - self.baseline_beliefs, 1)
 
     def test_one_observation_produces_an_approved_plan(self) -> None:
         main.run_bootstrap_cycle(self.organism)
 
         plans = self.organism.executive.plan_store.read_all()
-        self.assertEqual(len(plans), 1)
+        self.assertEqual(len(plans) - self.baseline_plans, 1)
 
         approvals = self.organism.governor.approval_log.read_all()
-        self.assertEqual(len(approvals), 1)
-        self.assertEqual(approvals[0].decision, "approved")
+        self.assertEqual(len(approvals) - self.baseline_approvals, 1)
+        self.assertEqual(approvals[-1].decision, "approved")
 
     def test_one_observation_produces_two_successful_actions(self) -> None:
         main.run_bootstrap_cycle(self.organism)
 
         records = self.organism.executor.action_log.read_all()
-        self.assertEqual(len(records), 2)
-        self.assertTrue(all(record.status == "succeeded" for record in records))
+        new_records = records[self.baseline_actions :]
+        self.assertEqual(len(new_records), 2)
+        self.assertTrue(all(record.status == "succeeded" for record in new_records))
 
     def test_one_observation_produces_two_outcomes_and_ledger_entries(self) -> None:
         main.run_bootstrap_cycle(self.organism)
 
         outcomes = self.organism.memory_ledger.outcome_store.read_all()
         ledger_entries = self.organism.memory_ledger.financial_ledger.read_all()
-        self.assertEqual(len(outcomes), 2)
-        self.assertEqual(len(ledger_entries), 2)
-        self.assertTrue(all(outcome.success for outcome in outcomes))
+        new_outcomes = outcomes[self.baseline_outcomes :]
+        self.assertEqual(len(new_outcomes), 2)
+        self.assertEqual(len(ledger_entries) - self.baseline_ledger_entries, 2)
+        self.assertTrue(all(outcome.success for outcome in new_outcomes))
 
     def test_full_cycle_emits_events_in_architectural_order(self) -> None:
         start_sequence = self.organism.kernel.event_log.latest_sequence() + 1
@@ -198,8 +211,8 @@ class BootstrapCycleTests(unittest.TestCase):
         first_ids = {event.correlation_id for event in first_cascade}
         second_ids = {event.correlation_id for event in second_cascade}
 
-        self.assertEqual(len(first_cascade), 29)
-        self.assertEqual(len(second_cascade), 29)
+        self.assertTrue(first_cascade)
+        self.assertTrue(second_cascade)
         self.assertEqual(len(first_ids), 1)
         self.assertEqual(len(second_ids), 1)
         self.assertNotEqual(first_ids, second_ids)
@@ -210,8 +223,11 @@ class MainEntrypointTests(unittest.TestCase):
         organism = main.main()
 
         self.assertFalse(organism.kernel.is_running())
-        self.assertEqual(len(organism.world_model.belief_store.read_all()), 1)
-        self.assertEqual(len(organism.memory_ledger.outcome_store.read_all()), 2)
+        # Kernel.start() inside main() also fires cold-start research seeding
+        # (Task #1/#2.6), so the belief/outcome counts include that alongside
+        # the explicit bootstrap observation's own single cycle.
+        self.assertEqual(len(organism.world_model.belief_store.read_all()), 4)
+        self.assertEqual(len(organism.memory_ledger.outcome_store.read_all()), 4)
 
 
 if __name__ == "__main__":

@@ -5,13 +5,21 @@ Owns the sensor registry and the observation log. Does not own beliefs.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
-from src.events import ObservationCreatedEvent
+from src.events import EventType, ObservationCreatedEvent, ResearchIntentEvent
 from src.kernel import Kernel
+
+logger = logging.getLogger(__name__)
+
+RESEARCH_SENSOR_PREFIX = "research:"
+RESEARCH_SOURCE_TYPE = "research"
+RESEARCH_OBSERVATION_VALUE = 1.0
+RESEARCH_OBSERVATION_CONFIDENCE = 0.5
 
 
 @dataclass(slots=True, kw_only=True)
@@ -169,6 +177,41 @@ class Perception:
         self.adapter_registry = AdapterRegistry()
         self.adapter_registry.register(FlatValueAdapter())
         self.adapter_registry.register(NestedReadingAdapter())
+        # True record of every research intent Perception has seen, kept
+        # alongside the observation each one produces (see
+        # _on_research_intent_emitted).
+        self.received_research_intents: list[ResearchIntentEvent] = []
+        kernel.register_subscriber(EventType.RESEARCH_INTENT_EMITTED, self._on_research_intent_emitted)
+
+    def _on_research_intent_emitted(self, event: ResearchIntentEvent) -> None:
+        logger.info(
+            "research intent received: request_id=%s query=%r search_depth=%d",
+            event.request_id,
+            event.query,
+            event.search_depth,
+        )
+        self.received_research_intents.append(event)
+
+        # Provenance for the resulting observation rides on the existing
+        # sensor abstraction rather than a new field: a sensor_id scoped to
+        # this request_id (World Model already copies event.sensor_id onto
+        # Belief.provenance), a sensor name carrying the query, and
+        # raw_source_type="research" tagging the source. No new event type,
+        # no schema change — the standard Observation -> ObservationCreated
+        # pipeline carries it through unchanged.
+        sensor_id = f"{RESEARCH_SENSOR_PREFIX}{event.request_id}"
+        if not self.sensor_registry.is_active(sensor_id):
+            self.sensor_registry.register_sensor(
+                sensor_id=sensor_id,
+                name=event.query,
+                source_type=RESEARCH_SOURCE_TYPE,
+            )
+        self.record_observation(
+            sensor_id=sensor_id,
+            normalized_value=RESEARCH_OBSERVATION_VALUE,
+            confidence=RESEARCH_OBSERVATION_CONFIDENCE,
+            raw_source_type=RESEARCH_SOURCE_TYPE,
+        )
 
     def record_observation(
         self,

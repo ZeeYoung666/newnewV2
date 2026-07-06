@@ -21,6 +21,7 @@ from src.events import (
     BeliefUpdatedEvent,
     EventType,
     ExecutiveDecisionEvent,
+    ExecutiveDeliberationStep,
     KernelStartedEvent,
     OpportunityGenerationCompletedEvent,
     OpportunityGenerationStartedEvent,
@@ -1086,6 +1087,8 @@ class Executive:
         funded_reasons: dict[str, str] = {}
         winner_plan_id: Optional[str] = None
         for candidate in ranked:
+            remaining_attention_before = remaining_attention
+            remaining_capital_before = remaining_capital
             attention_ok = candidate.attention_demand <= remaining_attention
             capital_ok = candidate.capital_demand <= remaining_capital
             funded = attention_ok and capital_ok
@@ -1096,8 +1099,37 @@ class Executive:
                 # is the highest-value executable plan — the winner.
                 if winner_plan_id is None:
                     winner_plan_id = candidate.plan.plan_id
+                allocation_reason = "funded"
             else:
-                funded_reasons[candidate.plan.plan_id] = self._shortfall_reason(attention_ok, capital_ok)
+                allocation_reason = self._shortfall_reason(attention_ok, capital_ok)
+                funded_reasons[candidate.plan.plan_id] = allocation_reason
+            # Trace-only: the running attention/capital budget and each
+            # candidate's demand never appear in any published event
+            # otherwise — PlanAbandonedEvent's reason is a qualitative
+            # string with no numbers to verify it against.
+            self._kernel.publish(
+                ExecutiveDeliberationStep(
+                    source_component="executive",
+                    step="allocation_check",
+                    inputs={
+                        "plan_id": candidate.plan.plan_id,
+                        "opportunity_id": candidate.opportunity.opportunity_id,
+                        "estimated_value": candidate.estimated_value,
+                        "attention_demand": candidate.attention_demand,
+                        "capital_demand": candidate.capital_demand,
+                        "remaining_attention_before": remaining_attention_before,
+                        "remaining_capital_before": remaining_capital_before,
+                    },
+                    outputs={
+                        "attention_ok": attention_ok,
+                        "capital_ok": capital_ok,
+                        "funded": funded,
+                        "remaining_attention_after": remaining_attention,
+                        "remaining_capital_after": remaining_capital,
+                    },
+                    reason=allocation_reason,
+                )
+            )
             allocations.append(
                 Allocation(
                     plan_id=candidate.plan.plan_id,
@@ -1134,7 +1166,7 @@ class Executive:
     def _build_candidate(self, sequence: int, plan_id: str) -> _Candidate:
         plan = self.plan_store.get(plan_id)
         opportunity = self.opportunity_store.get(plan.opportunity_id)
-        estimated_value = self._estimate_expected_value(opportunity)
+        estimated_value = self._estimate_expected_value(plan_id, opportunity)
         return _Candidate(
             sequence=sequence,
             plan=plan,
@@ -1144,7 +1176,7 @@ class Executive:
             capital_demand=round(estimated_value * CAPITAL_DEMAND_FRACTION, 4),
         )
 
-    def _estimate_expected_value(self, opportunity: Opportunity) -> float:
+    def _estimate_expected_value(self, plan_id: str, opportunity: Opportunity) -> float:
         """Estimate an opportunity's expected value through the Inference Port.
 
         The provider's judgment (its returned confidence) scales the
@@ -1164,7 +1196,28 @@ class Executive:
             constraints=(),
         )
         response = self._inference_port.infer(request)
-        return round(opportunity.expected_value * response.confidence, 4)
+        estimated_value = round(opportunity.expected_value * response.confidence, 4)
+        # Trace-only: makes the inference-port judgment that actually drives
+        # ranking/allocation visible, since it otherwise never appears in any
+        # published event (see ExecutiveDeliberationStep's docstring).
+        self._kernel.publish(
+            ExecutiveDeliberationStep(
+                source_component="executive",
+                step="ev_estimation",
+                inputs={
+                    "plan_id": plan_id,
+                    "opportunity_id": opportunity.opportunity_id,
+                    "raw_expected_value": opportunity.expected_value,
+                    "aggregated_confidence": opportunity.confidence,
+                },
+                outputs={
+                    "inference_confidence": response.confidence,
+                    "estimated_value": estimated_value,
+                },
+                reason="expected_value re-estimated through inference port",
+            )
+        )
+        return estimated_value
 
     @staticmethod
     def _shortfall_reason(attention_ok: bool, capital_ok: bool) -> str:
